@@ -1,0 +1,50 @@
+?start: [params NEWLINE] program
+
+params: NAME *
+
+program: statement+
+
+statement: lhs_array "[" aff_list "]" [ op ] "=" expression "#" "{" polyhedron "}" ";"
+
+lhs_array: NAME
+
+op: OP
+
+aff_list: (aff_expression ",")* aff_expression
+
+aff_expression: aff_expression_l2
+
+aff_expression_l2: atom_l2
+              | aff_expression_l2 "+" atom_l2
+              | aff_expression_l2 "-" atom_l2
+
+atom_l2: NAME
+      | atom_l1
+      | "(" aff_expression_l2 ")"
+      | atom_l1 "*"? atom_l2
+      | atom_l2 "*" atom_l1
+      | atom_l2 "/" atom_l1
+
+aff_expression_l1: atom_l1
+              | aff_expression_l1 "+" atom_l1
+              | aff_expression_l1 "-" atom_l1
+
+atom_l1: SIGNED_INT
+      | "(" aff_expression_l1 ")"
+      | atom_l1 "*" atom_l1
+      | atom_l1 "/" atom_l1
+
+// Currently these two below are just greedily consuming the input ...
+
+expression: /[^#]+/
+
+polyhedron: /[^}]+/
+
+OP: "+" | "-" | "max" | "min"
+
+%import common.CNAME -> NAME
+%import common.NUMBER -> NUMBER
+%import common.SIGNED_INT -> SIGNED_INT
+%import common.NEWLINE -> NEWLINE
+%import common.WS
+%ignore WS
