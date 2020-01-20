@@ -31,7 +31,7 @@ class TestIR(unittest.TestCase):
   def test_ir_parse_correct(self):
     prog = """N M
     A[i] += B[j] # {[i, j] : 0 <= i < N & 0 <= j < i};
-    X[i, (2*j+i/2)/2] = f(g(i), j) # { [j, i]: 0 <= i < N & 0 <= j < N };
+    X[i, (2*j+i//2)//2] = f(g(i), j) # { [j, i]: 0 <= i < N & 0 <= j < N };
     """
     prog1 = Program.read_from_string(prog, ctx=self.isl_ctx)
     prog2 = Program.read_from_string(repr(prog1))

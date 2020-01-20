@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import NewType, List, Tuple, Optional, Dict, Sequence, Union
+from typing import Iterator
 
 from dataclasses import dataclass
 
@@ -16,6 +17,7 @@ import ast
 import symtable
 import re
 import copy
+from functools import reduce
 
 from ordered_set import OrderedSet
 
@@ -30,6 +32,7 @@ import astor
 import ast_scope
 
 from polyppl.isl_utils import align_with_ids
+from polyppl.isl_patch import isl_ast_node_block_get_children
 
 VarID = NewType("VarID", str)
 ArrayID = NewType("ArrayID", str)
@@ -221,7 +224,7 @@ class NameReplacer(astor.TreeWalk):
   """Replaces global names in a python expression. """
 
   def __init__(self,
-               replace_map: Dict[VarID, VarID],
+               replace_map: Dict[VarID, ast.Expression],
                node: ast.Expression,
                scope_info=None,
                *args,
@@ -232,17 +235,16 @@ class NameReplacer(astor.TreeWalk):
     self.scope_info = scope_info
     astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
 
-  def pre_Name(self):
+  def post_Name(self):
     node = self.cur_node
     if isinstance(self.scope_info[node], ast_scope.scope.GlobalScope):
       if node.id in self.replace_map:
-        new_node = ast.Name(self.replace_map[node.id], node.ctx)
+        new_node = self.replace_map[node.id]
         self.replace(new_node)
-        return True
 
 
-def ast_replace_free_vars(node: ast.Expression, replacement_map: Dict[VarID,
-                                                                      VarID]):
+def ast_replace_free_vars(node: ast.Expression,
+                          replacement_map: Dict[VarID, ast.Expression]):
   """Replaces global free variables in a python ast expression.
 
   Args:
@@ -261,6 +263,49 @@ def ast_replace_free_vars(node: ast.Expression, replacement_map: Dict[VarID,
 ################################################################################
 #    BEGIN Statement
 ################################################################################
+
+
+def multi_aff_to_ast(multiaff: islpy.MultiAff,
+                     domain_space_names: List[VarID]) -> List[ast.AST]:
+  """Converts islpy.MultiAff into a python ast."""
+  multiaff = align_with_ids(multiaff, domain_space_names)
+  aff_asts = []
+  for i in range(multiaff.dim(islpy.dim_type.out)):
+    aff = multiaff.get_at(i)
+    coeffs = aff.get_coefficients_by_name(islpy.dim_type.in_)
+    terms = []
+    for var, coeff in coeffs.items():
+      if var == 1:
+        coeff = coeff.floor().to_python()
+        if coeff == 0:
+          continue
+        term = ast.Num(n=coeff)
+      else:
+        numerator = coeff.get_num_si()
+        if numerator == 1:
+          term = ast.Name(id=var, ctx=ast.Load())
+        elif numerator == 0:
+          continue
+        else:
+          term = ast.BinOp(left=ast.Num(n=numerator),
+                           op=ast.Mult(),
+                           right=ast.Name(id=var, ctx=ast.Load()))
+        try:
+          denom = coeff.get_den_val().to_python()
+          if denom != 1:
+            term = ast.BinOp(left=term, op=ast.FloorDiv(), right=ast.Num(denom))
+        except:
+          raise ValueError(
+              "Failed to cast multiaff due to denomerator not a python value")
+      terms.append(term)
+    if len(terms) > 0:
+      aff_ast = reduce(
+          lambda left, right: ast.BinOp(left=left, op=ast.Add(), right=right),
+          terms[1:], terms[0])
+      aff_asts.append(aff_ast)
+    else:
+      aff_asts = [ast.Num(n=0)]
+  return aff_asts
 
 
 class Statement(object):
@@ -329,19 +374,18 @@ class Statement(object):
   RE_DOMAIN = fr"{RE_TUPLE}{ARROW}(?P<polyhedron>{{[^}}]+}})"
 
   def __repr__(self):
-    lhs_proj_str = align_with_ids(self.lhs_proj,
-                                  self.domain_space_names).to_str()
-    aff_list = re.match(self.RE_LHS_PROJ, lhs_proj_str).group("aff_list")
-
+    aff_list_ast = multi_aff_to_ast(self.lhs_proj, self.domain_space_names)
+    aff_list_str = ",".join(
+        astor.to_source(aff_ast)[:-1] for aff_ast in aff_list_ast)
     domain_str = align_with_ids(self.domain, self.domain_space_names).to_str()
     polyhedron_str = re.match(self.RE_DOMAIN, domain_str)
     polyhedron = polyhedron_str.group("polyhedron")
     rhs_code = astor.to_source(self.rhs)
     rhs_code = rhs_code[:-1]  # removes training newline
-    return ("{lhs_array_name}{aff_list} "
+    return ("{lhs_array_name}[{aff_list}] "
             "{op}= {expression}\t# {polyhedron};").format(
                 lhs_array_name=self.lhs_array_name,
-                aff_list=aff_list,
+                aff_list=aff_list_str,
                 op=self.op if self.op else "",
                 expression=rhs_code,
                 polyhedron=polyhedron)
@@ -361,6 +405,8 @@ class Statement(object):
 
 class Program(object):
 
+  StatementID = NewType("StatementID", int)
+
   def __init__(self, ctx: islpy.Context):
     self.ctx = ctx
     self.param_space_names = OrderedSet()
@@ -373,9 +419,11 @@ class Program(object):
 
   def add_statement(self, stmt: Statement):
     self.add_params(stmt.param_space_names)
-    self.statements[self._unique_id_counter] = stmt
+    stmt_id = self._unique_id_counter
+    self.statements[stmt_id] = stmt
     self._unique_id_counter += 1
     stmt._set_parent_program(self)
+    return stmt_id
 
   def get_statement_by_id(self, statement_id):
     return self.statements[statement_id]
@@ -439,7 +487,8 @@ class Program(object):
 
       lhs_proj = "[{0}] -> {{ [{1}] -> [{2}] }}".format(
           ",".join(param_space_names), ",".join(domain_space_names),
-          get_text_from_node(safe_find_data(stmt_ast, "aff_list")))
+          get_text_from_node(safe_find_data(stmt_ast,
+                                            "aff_list")).replace("//", "/"))
       try:
         lhs_proj = islpy.MultiAff.read_from_str(ctx, lhs_proj)
       except islpyError:
@@ -532,8 +581,6 @@ class ASTCollectRead(astor.TreeWalk):
   def pre_Subscript(self):
     node = self.cur_node
     if isinstance(node.value, ast.Name):
-      import pdb
-      pdb.set_trace()
       if isinstance(self.scope_info[node.value], ast_scope.scope.GlobalScope):
         if node.value.id in self.declared_lhs_symbols:
           slic = node.slice
@@ -547,6 +594,11 @@ class ASTCollectRead(astor.TreeWalk):
           .format(node))
 
 
+def iter_named_statements(prog: Program) -> Iterator[str]:
+  for stmt_id, stmt in prog.statements.items():
+    yield stmt_id, "S{}".format(stmt_id), stmt
+
+
 def collect_reads(prog: Program) -> islpy.UnionMap:
   declared_lhs_symbols = [
       stmt.lhs_array_name for stmt in prog.statements.values()
@@ -556,8 +608,7 @@ def collect_reads(prog: Program) -> islpy.UnionMap:
                                     in_=[],
                                     out=[],
                                     params=prog.param_space_names))
-  for stmt_id, stmt in prog.statements.items():
-    stmt_id_name = "S{}".format(stmt_id)
+  for _, stmt_id_name, stmt in iter_named_statements(prog):
     read_asts = ASTCollectRead(stmt.rhs, declared_lhs_symbols).reads
     for read_ast in read_asts:
       slic = read_ast.slice
@@ -566,12 +617,10 @@ def collect_reads(prog: Program) -> islpy.UnionMap:
         target_str = astor.to_source(slic)[1:-2]
       else:
         # Single argument indexing
-        target_str = astor.to_source(slic)
+        target_str = astor.to_source(slic)[:-1]
       read_map_str = "[{}] -> {{ [{}] -> [{}] : }}".format(
           ",".join(stmt.param_space_names), ",".join(stmt.domain_space_names),
           target_str)
-      import pdb
-      pdb.set_trace()
       read_map = islpy.BasicMap.read_from_str(prog.ctx, read_map_str)
       read_map = read_map.intersect_domain(stmt.domain).set_tuple_name(
           islpy.dim_type.in_,
@@ -580,13 +629,244 @@ def collect_reads(prog: Program) -> islpy.UnionMap:
   return reads
 
 
+def compute_dependencies(prog: Program) -> islpy.UnionMap:
+  reads = collect_reads(prog)
+  writes = collect_writes(prog)
+  return writes.apply_range(reads.reverse())
+
+
+BarrierMap = Dict[Program.StatementID, Program.StatementID]
+
+
+def inject_reduction_barrier_statements(
+    prog: Program) -> Tuple[Program, BarrierMap]:
+  new_prog = copy.deepcopy(prog)
+  barrier_map: BarrierMap = {}
+  for stmt_id, _, stmt in iter_named_statements(prog):
+    if stmt.is_reduction:
+      intermediate_lhs_array_name = "_{}_".format(stmt.lhs_array_name)
+      new_prog.get_statement_by_id(
+          stmt_id).lhs_array_name = intermediate_lhs_array_name
+      tvars = tmp_vars(num=stmt.lhs_domain.n_dim())
+      lhs_proj = islpy.MultiAff.identity_on_domain_space(
+          stmt.lhs_domain.get_space())
+      new_stmt = Statement(
+          stmt.lhs_domain, stmt.param_space_names, tvars, stmt.lhs_array_name,
+          ast.parse("{}[{}]".format(intermediate_lhs_array_name,
+                                    ",".join(tvars)),
+                    mode="eval"), lhs_proj)
+      new_stmt_id = new_prog.add_statement(new_stmt)
+      barrier_map[stmt_id] = new_stmt_id
+  return new_prog, barrier_map
+
+
+def program_get_domain(prog: Program) -> islpy.UnionSet:
+  instance_set = islpy.UnionSet.empty(
+      islpy.Space.create_from_names(prog.ctx,
+                                    set=[],
+                                    params=prog.param_space_names))
+  for _, stmt_id_name, stmt in iter_named_statements(prog):
+    instance_set = instance_set.union(stmt.domain.set_tuple_name(stmt_id_name))
+  return instance_set
+
+
+def schedule_program(prog: Program) -> islpy.Schedule:
+  deps = compute_dependencies(prog)
+  instance_set = program_get_domain(prog)
+  schedule_constraint = islpy.ScheduleConstraints.on_domain(instance_set)
+  schedule_constraint = islpy.ScheduleConstraints.set_validity(
+      schedule_constraint, deps)
+  schedule_constraint = islpy.ScheduleConstraints.set_proximity(
+      schedule_constraint, deps)
+  schedule = islpy.ScheduleConstraints.compute_schedule(schedule_constraint)
+  return schedule
+
+
+def schedule_isl_ast_gen(
+    prog: Program,
+    schedule: islpy.Schedule,
+    barrier_map: Optional[BarrierMap] = None) -> islpy.AstNode:
+
+  # param_context asserts that all parameters are positive
+  param_space = islpy.Space.create_from_names(
+      prog.ctx, set=[], params=prog.param_space_names).params()
+  param_context = islpy.Set.universe(param_space)
+  for param_name in param_space.get_var_names(islpy.dim_type.param):
+    is_postive_constraint = islpy.Constraint.ineq_from_names(
+        param_space, {
+            1: -1,
+            param_name: 1
+        })
+    param_context = param_context.add_constraint(is_postive_constraint)
+
+  ast_build = islpy.AstBuild.from_context(param_context)
+
+  schedule_map = schedule.get_map().intersect_domain(program_get_domain(prog))
+
+  if barrier_map is not None:
+    barrier_stmt_ids = set(barrier_map.values())
+    to_remove_statements = {
+        stmt_id_name
+        for stmt_id, stmt_id_name, stmt in iter_named_statements(prog)
+        if stmt_id in barrier_stmt_ids
+    }
+    schedule_map = schedule_map.remove_map_if(
+        lambda m: m.get_tuple_name(islpy.dim_type.in_) in to_remove_statements)
+
+  ast = ast_build.node_from_schedule_map(schedule_map)
+  return ast
+
+
+def isl_ast_code_gen(prog: Program, isl_ast: islpy.AstNode) -> ast.AST:
+
+  def handle_node(node: islpy.AstNode) -> ast.AST:
+    node_type = node.get_type()
+    if node_type == islpy.ast_node_type.block:
+      return handle_block_node(node)
+    elif node_type == islpy.ast_node_type.for_:
+      return handle_for_node(node)
+    elif node_type == islpy.ast_node_type.if_:
+      return handle_if_node(node)
+    elif node_type == islpy.ast_node_type.user:
+      return handle_user_node(node)
+    else:
+      raise ValueError("Codegen encountered unsupported node type")
+
+  def handle_block_node(node: islpy.AstNode) -> ast.AST:
+    ret = []
+    for child_node in isl_ast_node_block_get_children(node):
+      child_ast = handle_node(child_node)
+      if isinstance(child_ast, list):
+        ret += child_ast
+      else:
+        ret.append(child_ast)
+    if len(ret) == 1:
+      ret = ret[0]
+    return ret
+
+  def handle_for_node(node: islpy.AstNode) -> ast.AST:
+    iterator_id = node.for_get_iterator().get_id()
+    init_exp = node.for_get_init()
+    cond_exp = node.for_get_cond()
+    inc_exp = node.for_get_inc()
+    body_node = node.for_get_body()
+
+    body_ast = handle_node(body_node)
+    while_loop_body_ast = []
+    if type(body_ast) is list:
+      while_loop_body_ast = body_ast
+    else:
+      while_loop_body_ast = [body_ast]
+
+    init_ast = ast.parse("{} = {}".format(iterator_id,
+                                          init_exp.to_C_str())).body[0]
+    cond_ast = ast.parse(cond_exp.to_C_str(), mode="eval").body
+    inc_ast = ast.parse("{} += {}".format(iterator_id,
+                                          inc_exp.to_C_str())).body[0]
+    while_loop_body_ast.append(inc_ast)
+    return [
+        init_ast,
+        ast.While(test=cond_ast, body=while_loop_body_ast, orelse=[])
+    ]
+
+  def handle_if_node(node: islpy.AstNode) -> ast.AST:
+    cond_exp = node.if_get_cond()
+    cond_ast = ast.parse(cond_exp.to_C_str(), mode="eval").body
+
+    then_node = node.if_get_then()
+    then_ast = handle_node(then_node)
+    if not isinstance(then_ast, list):
+      then_ast = [then_ast]
+
+    if node.if_has_else():
+      else_node = node.if_get_else()
+      else_ast = handle_node(else_node)
+    else:
+      else_ast = []
+    if not isinstance(else_ast, list):
+      else_ast = [else_ast]
+
+    return ast.If(test=cond_ast, body=then_ast, orelse=else_ast)
+
+  def handle_user_node(node: islpy.AstNode) -> ast.AST:
+    user_exp_node = node.user_get_expr()
+    if (user_exp_node.get_type() != islpy.ast_expr_type.op or
+        user_exp_node.get_op_type() != islpy.ast_expr_op_type.call):
+      raise ValueError("Unrecognized user node")
+    nargs = user_exp_node.op_get_n_arg()
+    target = user_exp_node.op_get_arg(0)
+    if target.get_type() != islpy.ast_expr_type.id:
+      raise ValueError("Unrecognized user node")
+
+    stmt_id_name = target.get_id().get_name()
+    stmt_id = int(stmt_id_name[1:])
+    stmt = prog.get_statement_by_id(stmt_id)
+
+    if nargs != len(stmt.domain_space_names) + 1:
+      raise ValueError("User node narg does not match domain space")
+
+    replace_map = {}
+    for i, name in enumerate(stmt.domain_space_names):
+      arg_exp = user_exp_node.op_get_arg(i + 1)
+      arg_ast = ast.parse(arg_exp.to_C_str(), mode="eval").body
+      replace_map[name] = arg_ast
+
+    lhs_index_ast_list = multi_aff_to_ast(stmt.lhs_proj,
+                                          stmt.domain_space_names)
+    if len(lhs_index_ast_list) == 1:
+      lhs_index_ast = lhs_index_ast_list[0]
+    else:
+      lhs_index_ast = ast.Tuple(elts=lhs_index_ast_list)
+    lhs_index_ast = ast.Expression(body=lhs_index_ast)
+    lhs_index_ast = ast_replace_free_vars(lhs_index_ast, replace_map).body
+
+    rhs_ast = ast_replace_free_vars(stmt.rhs, replace_map).body
+
+    if stmt.is_reduction:
+      assign_ast = ast.AugAssign(target=ast.Subscript(
+          value=ast.Name(id=stmt.lhs_array_name),
+          slice=ast.Index(value=lhs_index_ast)),
+                                 op=ast.Add(),
+                                 value=rhs_ast)
+    else:
+      assign_ast = ast.Assign(targets=[
+          ast.Subscript(value=ast.Name(id=stmt.lhs_array_name),
+                        slice=ast.Index(value=lhs_index_ast))
+      ],
+                              value=rhs_ast)
+    return assign_ast
+
+  ret_ast = handle_node(isl_ast)
+  ret_ast = ast.Module(body=ret_ast)
+  return ret_ast
+
+
+def debug_ast_node_to_str(isl_ast: islpy.AstNode) -> str:
+  printer = islpy.Printer.to_str(isl_ast.get_ctx())
+  printer = printer.set_output_format(islpy.format.C)
+  printer.flush()
+  printer.print_ast_node(isl_ast)
+  return printer.get_str()
+
+
 if __name__ == "__main__":
   prog = Program.read_from_string("""
   N
-  x[i, j] = f(j)                     # { [i, j] : 0 <= i < N & 0 <= j < i} ;
-  y[j] += g(x[i, j]) + (lambda x: x + y)   # { [i, j] : 0 <= i < N & 0 <= j < i } ;
-  z[i] += g(y[i])  # { [i] : 0 <= i < N } ;
+  A[i] += f(B[j])   # { [i, j] : 0 <= i < N & 0 <= j <= i } ;
+  B[i+1]  = f(A[i])   # { [i] : 0 <= i < N } ;
   """)
+  # prog = Program.read_from_string("""
+  # N
+  # A[i] = B[i]   # { [i] : 0 <= i < N} ;
+  # X[i] = A[i]   # { [i] : 0 <= i < N} ;
+  # """)
   writes = collect_writes(prog)
   reads = collect_reads(prog)
   dependencies = writes.apply_range(reads.reverse())
+  new_prog, barrier_map = inject_reduction_barrier_statements(prog)
+  # new_prog, barrier_map = prog, None
+  schedule = schedule_program(new_prog)
+  isl_ast = schedule_isl_ast_gen(new_prog, schedule, barrier_map=barrier_map)
+  cgen_ast = isl_ast_code_gen(prog, isl_ast)
+  # print(astor.dump_tree(cgen_ast))
+  print(astor.to_source(cgen_ast))

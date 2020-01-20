@@ -15,15 +15,23 @@ aff_list: (aff_expression ",")* aff_expression
 aff_expression: aff_expression_l2
 
 aff_expression_l2: atom_l2
-              | aff_expression_l2 "+" atom_l2
-              | aff_expression_l2 "-" atom_l2
+              | aff_expression_l2 ("+" | "-") atom_l2
 
 atom_l2: NAME
       | atom_l1
       | "(" aff_expression_l2 ")"
-      | atom_l1 "*"? atom_l2
+      | atom_l1 "*" atom_l2
       | atom_l2 "*" atom_l1
-      | atom_l2 "/" atom_l1
+      | atom_must_l2 "//" atom_l1
+
+aff_expression_must_l2: atom_must_l2
+              | aff_expression_must_l2 ("+" | "-") atom_l2
+              | atom_l2 ("+" | "-") aff_expression_must_l2
+
+atom_must_l2: NAME
+      | "(" aff_expression_must_l2 ")"
+      | atom_l1 "*" atom_must_l2
+      | atom_must_l2 "*" atom_l1
 
 aff_expression_l1: atom_l1
               | aff_expression_l1 "+" atom_l1
@@ -32,7 +40,6 @@ aff_expression_l1: atom_l1
 atom_l1: SIGNED_INT
       | "(" aff_expression_l1 ")"
       | atom_l1 "*" atom_l1
-      | atom_l1 "/" atom_l1
 
 // Currently these two below are just greedily consuming the input ...
 
