@@ -265,6 +265,43 @@ def ast_replace_free_vars(node: ast.Expression,
 ################################################################################
 
 
+def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
+  aff = align_with_ids(aff, domain_space_names)
+  coeffs = aff.get_coefficients_by_name(islpy.dim_type.in_)
+  terms = []
+  for var, coeff in coeffs.items():
+    if var == 1:
+      coeff = coeff.floor().to_python()
+      if coeff == 0:
+        continue
+      term = ast.Num(n=coeff)
+    else:
+      numerator = coeff.get_num_si()
+      if numerator == 1:
+        term = ast.Name(id=var, ctx=ast.Load())
+      elif numerator == 0:
+        continue
+      else:
+        term = ast.BinOp(left=ast.Num(n=numerator),
+                         op=ast.Mult(),
+                         right=ast.Name(id=var, ctx=ast.Load()))
+      try:
+        denom = coeff.get_den_val().to_python()
+        if denom != 1:
+          term = ast.BinOp(left=term, op=ast.FloorDiv(), right=ast.Num(denom))
+      except:
+        raise ValueError(
+            "Failed to cast multiaff due to denomerator not a python value")
+    terms.append(term)
+  if len(terms) > 0:
+    aff_ast = reduce(
+        lambda left, right: ast.BinOp(left=left, op=ast.Add(), right=right),
+        terms[1:], terms[0])
+  else:
+    aff_ast = ast.Num(n=0)
+  return aff_ast
+
+
 def multi_aff_to_ast(multiaff: islpy.MultiAff,
                      domain_space_names: List[VarID]) -> List[ast.AST]:
   """Converts islpy.MultiAff into a python ast."""
@@ -272,39 +309,8 @@ def multi_aff_to_ast(multiaff: islpy.MultiAff,
   aff_asts = []
   for i in range(multiaff.dim(islpy.dim_type.out)):
     aff = multiaff.get_at(i)
-    coeffs = aff.get_coefficients_by_name(islpy.dim_type.in_)
-    terms = []
-    for var, coeff in coeffs.items():
-      if var == 1:
-        coeff = coeff.floor().to_python()
-        if coeff == 0:
-          continue
-        term = ast.Num(n=coeff)
-      else:
-        numerator = coeff.get_num_si()
-        if numerator == 1:
-          term = ast.Name(id=var, ctx=ast.Load())
-        elif numerator == 0:
-          continue
-        else:
-          term = ast.BinOp(left=ast.Num(n=numerator),
-                           op=ast.Mult(),
-                           right=ast.Name(id=var, ctx=ast.Load()))
-        try:
-          denom = coeff.get_den_val().to_python()
-          if denom != 1:
-            term = ast.BinOp(left=term, op=ast.FloorDiv(), right=ast.Num(denom))
-        except:
-          raise ValueError(
-              "Failed to cast multiaff due to denomerator not a python value")
-      terms.append(term)
-    if len(terms) > 0:
-      aff_ast = reduce(
-          lambda left, right: ast.BinOp(left=left, op=ast.Add(), right=right),
-          terms[1:], terms[0])
-      aff_asts.append(aff_ast)
-    else:
-      aff_asts = [ast.Num(n=0)]
+    aff_ast = aff_to_ast(aff, domain_space_names)
+    aff_asts.append(aff_ast)
   return aff_asts
 
 
@@ -322,9 +328,7 @@ class Statement(object):
       else:
         return False
 
-  class ReductionOp(enum.Enum):
-    PLUS = "+"
-    MULTIPLY = "*"
+  ReductionOpId = NewType("ReductionOpId", str)
 
   def __init__(self,
                domain: BasicSet,
@@ -333,7 +337,7 @@ class Statement(object):
                lhs_array_name: ArrayID,
                rhs: Expression,
                lhs_proj: MultiAff,
-               op: Optional[ReductionOp] = None,
+               op: Optional[ReductionOpId] = None,
                non_affine_constraints: List[NonAffineConstraint] = []):
     self.domain = domain
     self.param_space_names = param_space_names
@@ -614,7 +618,13 @@ def collect_reads(prog: Program) -> islpy.UnionMap:
       slic = read_ast.slice
       if isinstance(slic.value, ast.Tuple):
         # Multiple argument indexing
-        target_str = astor.to_source(slic)[1:-2]
+        if len(slic.value.elts) == 0:
+          raise ValueError("Indexed defined array with empty "
+                           "tuple instead of affine expression")
+        if len(slic.value.elts) == 1:
+          target_str = astor.to_source(slic.value.elts[0])[:-1]
+        else:
+          target_str = astor.to_source(slic)[1:-2]
       else:
         # Single argument indexing
         target_str = astor.to_source(slic)[:-1]
@@ -715,158 +725,3 @@ def schedule_isl_ast_gen(
 
   ast = ast_build.node_from_schedule_map(schedule_map)
   return ast
-
-
-def isl_ast_code_gen(prog: Program, isl_ast: islpy.AstNode) -> ast.AST:
-
-  def handle_node(node: islpy.AstNode) -> ast.AST:
-    node_type = node.get_type()
-    if node_type == islpy.ast_node_type.block:
-      return handle_block_node(node)
-    elif node_type == islpy.ast_node_type.for_:
-      return handle_for_node(node)
-    elif node_type == islpy.ast_node_type.if_:
-      return handle_if_node(node)
-    elif node_type == islpy.ast_node_type.user:
-      return handle_user_node(node)
-    else:
-      raise ValueError("Codegen encountered unsupported node type")
-
-  def handle_block_node(node: islpy.AstNode) -> ast.AST:
-    ret = []
-    for child_node in isl_ast_node_block_get_children(node):
-      child_ast = handle_node(child_node)
-      if isinstance(child_ast, list):
-        ret += child_ast
-      else:
-        ret.append(child_ast)
-    if len(ret) == 1:
-      ret = ret[0]
-    return ret
-
-  def handle_for_node(node: islpy.AstNode) -> ast.AST:
-    iterator_id = node.for_get_iterator().get_id()
-    init_exp = node.for_get_init()
-    cond_exp = node.for_get_cond()
-    inc_exp = node.for_get_inc()
-    body_node = node.for_get_body()
-
-    body_ast = handle_node(body_node)
-    while_loop_body_ast = []
-    if type(body_ast) is list:
-      while_loop_body_ast = body_ast
-    else:
-      while_loop_body_ast = [body_ast]
-
-    init_ast = ast.parse("{} = {}".format(iterator_id,
-                                          init_exp.to_C_str())).body[0]
-    cond_ast = ast.parse(cond_exp.to_C_str(), mode="eval").body
-    inc_ast = ast.parse("{} += {}".format(iterator_id,
-                                          inc_exp.to_C_str())).body[0]
-    while_loop_body_ast.append(inc_ast)
-    return [
-        init_ast,
-        ast.While(test=cond_ast, body=while_loop_body_ast, orelse=[])
-    ]
-
-  def handle_if_node(node: islpy.AstNode) -> ast.AST:
-    cond_exp = node.if_get_cond()
-    cond_ast = ast.parse(cond_exp.to_C_str(), mode="eval").body
-
-    then_node = node.if_get_then()
-    then_ast = handle_node(then_node)
-    if not isinstance(then_ast, list):
-      then_ast = [then_ast]
-
-    if node.if_has_else():
-      else_node = node.if_get_else()
-      else_ast = handle_node(else_node)
-    else:
-      else_ast = []
-    if not isinstance(else_ast, list):
-      else_ast = [else_ast]
-
-    return ast.If(test=cond_ast, body=then_ast, orelse=else_ast)
-
-  def handle_user_node(node: islpy.AstNode) -> ast.AST:
-    user_exp_node = node.user_get_expr()
-    if (user_exp_node.get_type() != islpy.ast_expr_type.op or
-        user_exp_node.get_op_type() != islpy.ast_expr_op_type.call):
-      raise ValueError("Unrecognized user node")
-    nargs = user_exp_node.op_get_n_arg()
-    target = user_exp_node.op_get_arg(0)
-    if target.get_type() != islpy.ast_expr_type.id:
-      raise ValueError("Unrecognized user node")
-
-    stmt_id_name = target.get_id().get_name()
-    stmt_id = int(stmt_id_name[1:])
-    stmt = prog.get_statement_by_id(stmt_id)
-
-    if nargs != len(stmt.domain_space_names) + 1:
-      raise ValueError("User node narg does not match domain space")
-
-    replace_map = {}
-    for i, name in enumerate(stmt.domain_space_names):
-      arg_exp = user_exp_node.op_get_arg(i + 1)
-      arg_ast = ast.parse(arg_exp.to_C_str(), mode="eval").body
-      replace_map[name] = arg_ast
-
-    lhs_index_ast_list = multi_aff_to_ast(stmt.lhs_proj,
-                                          stmt.domain_space_names)
-    if len(lhs_index_ast_list) == 1:
-      lhs_index_ast = lhs_index_ast_list[0]
-    else:
-      lhs_index_ast = ast.Tuple(elts=lhs_index_ast_list)
-    lhs_index_ast = ast.Expression(body=lhs_index_ast)
-    lhs_index_ast = ast_replace_free_vars(lhs_index_ast, replace_map).body
-
-    rhs_ast = ast_replace_free_vars(stmt.rhs, replace_map).body
-
-    if stmt.is_reduction:
-      assign_ast = ast.AugAssign(target=ast.Subscript(
-          value=ast.Name(id=stmt.lhs_array_name),
-          slice=ast.Index(value=lhs_index_ast)),
-                                 op=ast.Add(),
-                                 value=rhs_ast)
-    else:
-      assign_ast = ast.Assign(targets=[
-          ast.Subscript(value=ast.Name(id=stmt.lhs_array_name),
-                        slice=ast.Index(value=lhs_index_ast))
-      ],
-                              value=rhs_ast)
-    return assign_ast
-
-  ret_ast = handle_node(isl_ast)
-  ret_ast = ast.Module(body=ret_ast)
-  return ret_ast
-
-
-def debug_ast_node_to_str(isl_ast: islpy.AstNode) -> str:
-  printer = islpy.Printer.to_str(isl_ast.get_ctx())
-  printer = printer.set_output_format(islpy.format.C)
-  printer.flush()
-  printer.print_ast_node(isl_ast)
-  return printer.get_str()
-
-
-if __name__ == "__main__":
-  prog = Program.read_from_string("""
-  N
-  A[i] += f(B[j])   # { [i, j] : 0 <= i < N & 0 <= j <= i } ;
-  B[i+1]  = f(A[i])   # { [i] : 0 <= i < N } ;
-  """)
-  # prog = Program.read_from_string("""
-  # N
-  # A[i] = B[i]   # { [i] : 0 <= i < N} ;
-  # X[i] = A[i]   # { [i] : 0 <= i < N} ;
-  # """)
-  writes = collect_writes(prog)
-  reads = collect_reads(prog)
-  dependencies = writes.apply_range(reads.reverse())
-  new_prog, barrier_map = inject_reduction_barrier_statements(prog)
-  # new_prog, barrier_map = prog, None
-  schedule = schedule_program(new_prog)
-  isl_ast = schedule_isl_ast_gen(new_prog, schedule, barrier_map=barrier_map)
-  cgen_ast = isl_ast_code_gen(prog, isl_ast)
-  # print(astor.dump_tree(cgen_ast))
-  print(astor.to_source(cgen_ast))

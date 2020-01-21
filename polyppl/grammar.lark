@@ -47,7 +47,7 @@ expression: /[^#]+/
 
 polyhedron: /[^}]+/
 
-OP: "+" | "-" | "max" | "min"
+OP: "+" | "*" | "max" | "min"
 
 %import common.CNAME -> NAME
 %import common.NUMBER -> NUMBER
@@ -55,3 +55,6 @@ OP: "+" | "-" | "max" | "min"
 %import common.NEWLINE -> NEWLINE
 %import common.WS
 %ignore WS
+
+COMMENT: /#[^\n]*/
+%ignore COMMENT

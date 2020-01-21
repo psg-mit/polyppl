@@ -19,13 +19,15 @@ def aff_align_in_ids(aff, names):
   return aff
 
 
-def align_with_ids(obj: Union[islpy.BasicSet, islpy.MultiAff],
-                   names: List[str]):
-  if isinstance(obj, islpy.BasicSet):
+def align_with_ids(obj: Union[islpy.BasicSet, islpy.Set, islpy.Aff,
+                              islpy.MultiAff], names: List[str]):
+  if isinstance(obj, islpy.Set) or isinstance(obj, islpy.BasicSet):
     return set_align_dim_ids(obj, names)
-  elif isinstance(obj, islpy.MultiAff):
+  elif isinstance(obj, islpy.MultiAff) or isinstance(obj, islpy.Aff):
     return aff_align_in_ids(obj, names)
   else:
+    import pdb
+    pdb.set_trace()
     raise TypeError("Invalid input")
 
 
