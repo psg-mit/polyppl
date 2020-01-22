@@ -3,8 +3,9 @@ import unittest
 import islpy
 from polyppl.ir import *  # pylint: disable=unused-wildcard-import
 
+from tests.base import PolyPPLTestCaseBase
 
-class TestIR(unittest.TestCase):
+class TestIR(PolyPPLTestCaseBase):
 
   def setUp(self):
     self.isl_ctx = islpy.Context()

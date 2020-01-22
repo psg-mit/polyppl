@@ -201,6 +201,8 @@ def collect_free_vars(node: ast.AST):
   Note that this function uses symtable,
   which requires potentially re-parsing from Python source.
   """
+  if not isinstance(node, ast.Expression) and not isinstance(node, ast.Module):
+    node = ast.Expression(body=node)
   src = astor.to_source(node)
   symbol_table = symtable.symtable(src, "top", "exec")
 
@@ -406,6 +408,23 @@ class Statement(object):
             self.non_affine_constraints == other.non_affine_constraints and
             self.rhs == other.rhs)
 
+  def __copy__(self):
+    cls = self.__class__
+    result = cls.__new__(cls)
+    result.__dict__.update(self.__dict__)
+    return result
+
+  def __deepcopy__(self, memo):
+    cls = self.__class__
+    result = cls.__new__(cls)
+    memo[id(self)] = result
+    for k, v in self.__dict__.items():
+      if k not in {"domain", "lhs_proj"}:
+        setattr(result, k, copy.deepcopy(v, memo))
+      else:
+        setattr(result, k, v)
+    return result
+
 
 class Program(object):
 
@@ -543,185 +562,19 @@ class Program(object):
         return False
     return True
 
+  def __copy__(self):
+    cls = self.__class__
+    result = cls.__new__(cls)
+    result.__dict__.update(self.__dict__)
+    return result
 
-################################################################################
-# Dependence analysis and Scheduling
-################################################################################
-
-
-def collect_writes(prog: Program) -> islpy.UnionMap:
-  writes = islpy.UnionMap.empty(
-      islpy.Space.create_from_names(prog.ctx,
-                                    in_=[],
-                                    out=[],
-                                    params=prog.param_space_names))
-  for stmt_id, stmt in prog.statements.items():
-    stmt_id_name = "S{}".format(stmt_id)
-    stmt_writes = stmt.lhs_proj_map.intersect_domain(
-        stmt.domain).set_tuple_name(islpy.dim_type.in_,
-                                    stmt_id_name).set_tuple_name(
-                                        islpy.dim_type.out, stmt.lhs_array_name)
-    writes = writes.union(stmt_writes)
-  return writes
-
-
-class ASTCollectRead(astor.TreeWalk):
-
-  def __init__(self,
-               node: ast.Expression,
-               declared_lhs_symbols: List[VarID],
-               scope_info=None,
-               *args,
-               **kwargs):
-    if scope_info is None:
-      scope_info = ast_scope.annotate(node)
-    self.scope_info = scope_info
-    self.declared_lhs_symbols = set(declared_lhs_symbols)
-    astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
-
-  def init_Subscript(self):
-    self.reads = []
-
-  def pre_Subscript(self):
-    node = self.cur_node
-    if isinstance(node.value, ast.Name):
-      if isinstance(self.scope_info[node.value], ast_scope.scope.GlobalScope):
-        if node.value.id in self.declared_lhs_symbols:
-          slic = node.slice
-          if not isinstance(slic, ast.Index):
-            raise ValueError(
-                "Advanced indexing for array reads within IR not implemented")
-          self.reads.append(node)
-    else:
-      raise Warning(
-          "Ignored array access {}: assume does not exist dependency on IR arrays"
-          .format(node))
-
-
-def iter_named_statements(prog: Program) -> Iterator[str]:
-  for stmt_id, stmt in prog.statements.items():
-    yield stmt_id, "S{}".format(stmt_id), stmt
-
-
-def collect_reads(prog: Program) -> islpy.UnionMap:
-  declared_lhs_symbols = [
-      stmt.lhs_array_name for stmt in prog.statements.values()
-  ]
-  reads = islpy.UnionMap.empty(
-      islpy.Space.create_from_names(prog.ctx,
-                                    in_=[],
-                                    out=[],
-                                    params=prog.param_space_names))
-  for _, stmt_id_name, stmt in iter_named_statements(prog):
-    read_asts = ASTCollectRead(stmt.rhs, declared_lhs_symbols).reads
-    for read_ast in read_asts:
-      slic = read_ast.slice
-      if isinstance(slic.value, ast.Tuple):
-        # Multiple argument indexing
-        if len(slic.value.elts) == 0:
-          raise ValueError("Indexed defined array with empty "
-                           "tuple instead of affine expression")
-        if len(slic.value.elts) == 1:
-          target_str = astor.to_source(slic.value.elts[0])[:-1]
-        else:
-          target_str = astor.to_source(slic)[1:-2]
+  def __deepcopy__(self, memo):
+    cls = self.__class__
+    result = cls.__new__(cls)
+    memo[id(self)] = result
+    for k, v in self.__dict__.items():
+      if k not in {"ctx"}:
+        setattr(result, k, copy.deepcopy(v, memo))
       else:
-        # Single argument indexing
-        target_str = astor.to_source(slic)[:-1]
-      read_map_str = "[{}] -> {{ [{}] -> [{}] : }}".format(
-          ",".join(stmt.param_space_names), ",".join(stmt.domain_space_names),
-          target_str)
-      read_map = islpy.BasicMap.read_from_str(prog.ctx, read_map_str)
-      read_map = read_map.intersect_domain(stmt.domain).set_tuple_name(
-          islpy.dim_type.in_,
-          stmt_id_name).set_tuple_name(islpy.dim_type.out, read_ast.value.id)
-      reads = reads.union(read_map)
-  return reads
-
-
-def compute_dependencies(prog: Program) -> islpy.UnionMap:
-  reads = collect_reads(prog)
-  writes = collect_writes(prog)
-  return writes.apply_range(reads.reverse())
-
-
-BarrierMap = Dict[Program.StatementID, Program.StatementID]
-
-
-def inject_reduction_barrier_statements(
-    prog: Program) -> Tuple[Program, BarrierMap]:
-  new_prog = copy.deepcopy(prog)
-  barrier_map: BarrierMap = {}
-  for stmt_id, _, stmt in iter_named_statements(prog):
-    if stmt.is_reduction:
-      intermediate_lhs_array_name = "_{}_".format(stmt.lhs_array_name)
-      new_prog.get_statement_by_id(
-          stmt_id).lhs_array_name = intermediate_lhs_array_name
-      tvars = tmp_vars(num=stmt.lhs_domain.n_dim())
-      lhs_proj = islpy.MultiAff.identity_on_domain_space(
-          stmt.lhs_domain.get_space())
-      new_stmt = Statement(
-          stmt.lhs_domain, stmt.param_space_names, tvars, stmt.lhs_array_name,
-          ast.parse("{}[{}]".format(intermediate_lhs_array_name,
-                                    ",".join(tvars)),
-                    mode="eval"), lhs_proj)
-      new_stmt_id = new_prog.add_statement(new_stmt)
-      barrier_map[stmt_id] = new_stmt_id
-  return new_prog, barrier_map
-
-
-def program_get_domain(prog: Program) -> islpy.UnionSet:
-  instance_set = islpy.UnionSet.empty(
-      islpy.Space.create_from_names(prog.ctx,
-                                    set=[],
-                                    params=prog.param_space_names))
-  for _, stmt_id_name, stmt in iter_named_statements(prog):
-    instance_set = instance_set.union(stmt.domain.set_tuple_name(stmt_id_name))
-  return instance_set
-
-
-def schedule_program(prog: Program) -> islpy.Schedule:
-  deps = compute_dependencies(prog)
-  instance_set = program_get_domain(prog)
-  schedule_constraint = islpy.ScheduleConstraints.on_domain(instance_set)
-  schedule_constraint = islpy.ScheduleConstraints.set_validity(
-      schedule_constraint, deps)
-  schedule_constraint = islpy.ScheduleConstraints.set_proximity(
-      schedule_constraint, deps)
-  schedule = islpy.ScheduleConstraints.compute_schedule(schedule_constraint)
-  return schedule
-
-
-def schedule_isl_ast_gen(
-    prog: Program,
-    schedule: islpy.Schedule,
-    barrier_map: Optional[BarrierMap] = None) -> islpy.AstNode:
-
-  # param_context asserts that all parameters are positive
-  param_space = islpy.Space.create_from_names(
-      prog.ctx, set=[], params=prog.param_space_names).params()
-  param_context = islpy.Set.universe(param_space)
-  for param_name in param_space.get_var_names(islpy.dim_type.param):
-    is_postive_constraint = islpy.Constraint.ineq_from_names(
-        param_space, {
-            1: -1,
-            param_name: 1
-        })
-    param_context = param_context.add_constraint(is_postive_constraint)
-
-  ast_build = islpy.AstBuild.from_context(param_context)
-
-  schedule_map = schedule.get_map().intersect_domain(program_get_domain(prog))
-
-  if barrier_map is not None:
-    barrier_stmt_ids = set(barrier_map.values())
-    to_remove_statements = {
-        stmt_id_name
-        for stmt_id, stmt_id_name, stmt in iter_named_statements(prog)
-        if stmt_id in barrier_stmt_ids
-    }
-    schedule_map = schedule_map.remove_map_if(
-        lambda m: m.get_tuple_name(islpy.dim_type.in_) in to_remove_statements)
-
-  ast = ast_build.node_from_schedule_map(schedule_map)
-  return ast
+        setattr(result, k, v)
+    return result
