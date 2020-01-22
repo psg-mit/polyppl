@@ -1,3 +1,5 @@
+"""Simplifcation Transformation."""
+
 import islpy
 
 from typing import Callable, List
@@ -95,7 +97,7 @@ def simplification_transformation(prog: ir.Program,
   index_args = ir.multi_aff_to_ast(r_f, lhs_space_tmp_var_names)
   shifted_X_access = _make_subscript_ast(reduction.lhs_array_name, index_args)
 
-  def handle_1_case(D, rhs_expression_f: Callable[[], ir.Expression]):
+  def handle_1_case(D, rhs_expression_f: Callable[[], ast.AST]):
     if not D.is_empty():
       stmt = ir.Statement(
           D,

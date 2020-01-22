@@ -49,7 +49,11 @@ def listify_ast(ast: Union[List[ast.AST], ast.AST]) -> List[ast.AST]:
 
 
 def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+  """Generate ast for a loop node.
 
+  This routine attempts to generate a for-range loop whenever possible (which
+  is the case most of the time), and resort to a generic while loop if necessary
+  """
   iterator_id = node.for_get_iterator().get_id().get_name()
   init_exp = node.for_get_init()
   cond_exp = node.for_get_cond()
@@ -112,6 +116,7 @@ def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
 
 
 def code_gen_if_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+  """Generate ast for a condition node."""
   cond_exp = node.if_get_cond()
   cond_ast = code_gen_exp(cond_exp)
 
@@ -128,6 +133,7 @@ def code_gen_if_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
 
 
 def code_gen_user_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+  """Generate ast for a user node."""
   user_exp_node = node.user_get_expr()
   if (user_exp_node.get_type() != islpy.ast_expr_type.op or
       user_exp_node.get_op_type() != islpy.ast_expr_op_type.call):
