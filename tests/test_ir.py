@@ -5,29 +5,8 @@ from polyppl.ir import *  # pylint: disable=unused-wildcard-import
 
 from tests.base import PolyPPLTestCaseBase
 
+
 class TestIR(PolyPPLTestCaseBase):
-
-  def setUp(self):
-    self.isl_ctx = islpy.Context()
-    self.isl_ctx.set_on_error(1)  # continue then raise exception
-
-  def test_affine_expression_cast(self):
-    exp = AffineExpression("+", [
-        AffineExpression("+", [
-            RefExpression("x"),
-            AffineExpression("+", [
-                RefExpression("y"),
-                AffineExpression("+", [
-                    OpExpression("-", [RefExpression("z")]),
-                    ConstExpression(1)
-                ])
-            ])
-        ])
-    ])
-    aff_exp = expression_to_isl(exp, ["x", "y"], params=["z"], ctx=self.isl_ctx)
-    aff_exp_correct = islpy.Aff.read_from_str(
-        self.isl_ctx, "[z] -> { [x, y] -> [x + y - z + 1] }")
-    self.assertEqual(aff_exp, aff_exp_correct)
 
   def test_ir_parse_correct(self):
     prog = """N M
@@ -53,7 +32,7 @@ class TestIR(PolyPPLTestCaseBase):
 
     # domain mismatch 2
     progs.append("""N M
-    A[i] = B[j] # { [i] :  };
+    A[i*i] = B[j] # { [i] :  };
     """)
 
     # lhs_proj not valid

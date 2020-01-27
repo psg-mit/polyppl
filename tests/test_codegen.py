@@ -1,6 +1,8 @@
 import unittest
 
+import astor
 import islpy
+
 import polyppl.ir as ir
 import polyppl.code_gen as code_gen
 from tests.base import PolyPPLTestCaseBase
@@ -28,6 +30,15 @@ class TestIR(PolyPPLTestCaseBase):
     x[i,t+1] = x_new[i, t] # {[i, t] : 0 <= i < N & 0 <= t < T - 1};
     """
     ast = code_gen.prog_str_to_ast(prog_str)
+
+  def test_circular_dep(self):
+    prog_str = """
+    N
+    A[i] = f(B[i])     # { [i] : 0 <= i < N };
+    B[i+1] = g(A[i])   # { [i] : 0 <= i < N };
+    """
+    ast = code_gen.prog_str_to_ast(prog_str)
+    print(astor.to_source(ast))
 
 
 if __name__ == '__main__':

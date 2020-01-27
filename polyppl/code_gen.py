@@ -1,3 +1,8 @@
+"""ISL AST to Python AST.
+
+This module implements recursive code generation from ISL to Python.
+"""
+
 from typing import Union, List
 
 import ast
@@ -5,15 +10,15 @@ import astor
 
 import islpy
 
-from polyppl.isl_patch import isl_ast_node_block_get_children
 import polyppl.ir as ir
 import polyppl.schedule as schedule
 
 
 def code_gen_exp(node: islpy.AstExpr) -> ast.AST:
-  # TODO(camyang) fix this lazziness
+  # TODO(camyang) fix this laziness
   # this should not work for certain op type
-  c_str = node.to_C_str().replace("&&", "and").replace("||", "or")
+  c_str = node.to_C_str().replace("&&", "and").replace("||",
+                                                       "or").replace("/", "//")
   return ast.parse(c_str, mode="eval").body
 
 
@@ -33,7 +38,9 @@ def code_gen_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
 
 def code_gen_block_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
   ret = []
-  for child_node in isl_ast_node_block_get_children(node):
+  block_inner_list = node.block_get_children()
+  for i in range(block_inner_list.n_ast_node()):
+    child_node = block_inner_list.get_ast_node(i)
     child_ast = code_gen_node(prog, child_node)
     ret += listify_ast(child_ast)
   if len(ret) == 1:
@@ -75,8 +82,10 @@ def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
     right = cond_exp.op_get_arg(1)
     if left == node.for_get_iterator():
       potential_cond_exp = right
+      var_on_side = "left"
     elif right == node.for_get_iterator():
       potential_cond_exp = left
+      var_on_side = "right"
     else:
       generate_for = False
     if generate_for:
@@ -97,6 +106,20 @@ def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
 
   if generate_for:
     # Generate a for-range loop
+    cond_ast_eq_adjust_map = {
+        ("left", islpy.ast_expr_op_type.ge): -1,
+        ("right", islpy.ast_expr_op_type.ge): 1,
+        ("left", islpy.ast_expr_op_type.le): 1,
+        ("right", islpy.ast_expr_op_type.ge): -1,
+    }
+    adjust_map_query = (var_on_side, cond_exp.get_op_type())
+    if adjust_map_query in cond_ast_eq_adjust_map:
+      # If cond op is <= or >=, adjust the +/-1 boundary for `range` call
+      adjust = cond_ast_eq_adjust_map[adjust_map_query]
+      if adjust == 1:
+        cond_ast = ast.BinOp(left=cond_ast, op=ast.Add(), right=ast.Num(n=1))
+      else:
+        cond_ast = ast.BinOp(left=cond_ast, op=ast.Sub(), right=ast.Num(n=1))
     return ast.For(target=ast.Name(id=iterator_id, ctx=ast.Store()),
                    iter=ast.Call(func=ast.Name(id="range"),
                                  args=[init_ast, cond_ast, inc_ast],
@@ -153,11 +176,12 @@ def code_gen_user_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
   replace_map = {}
   for i, name in enumerate(stmt.domain_space_names):
     arg_exp = user_exp_node.op_get_arg(i + 1)
-    arg_ast = ast.parse(arg_exp.to_C_str(), mode="eval").body
+    arg_ast = code_gen_exp(arg_exp)
     replace_map[name] = arg_ast
 
   lhs_index_ast_list = ir.multi_aff_to_ast(stmt.lhs_proj,
                                            stmt.domain_space_names)
+
   if len(lhs_index_ast_list) == 1:
     lhs_index_ast = lhs_index_ast_list[0]
   else:

@@ -1,10 +1,14 @@
-"""Patch islpy and ISL.
+"""!! Deprecated!!
+Patch islpy and ISL.
 
 This module is really not desirable.
 Consider removing this module after ISL exposes necessary interface.
 
 Ref: https://github.com/inducer/islpy/issues/21
 """
+
+import warnings
+warnings.warn("This module is deprecated")
 
 from typing import List
 
@@ -28,7 +32,9 @@ typedef struct {
 """)
 
 
-def isl_ast_node_block_get_children(node: islpy.AstNode) -> List[islpy.AstNode]:
+def isl_ast_node_block_get_children_patch(
+    node: islpy.AstNode) -> List[islpy.AstNode]:
+  """Hacks ISL internal to get block children using CFFI."""
   ast_node_list_ptr = isl_ffi_lib.isl_ast_node_block_get_children(node.data)
   ast_node_list_ptr = _ffi.cast("isl_ast_node_list*", ast_node_list_ptr)
   ret = []

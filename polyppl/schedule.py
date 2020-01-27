@@ -62,11 +62,6 @@ class ASTCollectRead(astor.TreeWalk):
           .format(node))
 
 
-def iter_named_statements(prog: ir.Program) -> Iterator[str]:
-  for stmt_id, stmt in prog.statements.items():
-    yield stmt_id, "S{}".format(stmt_id), stmt
-
-
 def collect_reads(prog: ir.Program) -> islpy.UnionMap:
   declared_lhs_symbols = [
       stmt.lhs_array_name for stmt in prog.statements.values()
@@ -76,26 +71,14 @@ def collect_reads(prog: ir.Program) -> islpy.UnionMap:
                                     in_=[],
                                     out=[],
                                     params=prog.param_space_names))
-  for _, stmt_id_name, stmt in iter_named_statements(prog):
+  for _, stmt_id_name, stmt in prog.iter_named_statements():
+    affine_expr_collector = ir.AffineExpresionCollector(stmt.domain_space_names,
+                                                        stmt.rhs)
     read_asts = ASTCollectRead(stmt.rhs, declared_lhs_symbols).reads
     for read_ast in read_asts:
-      slic = read_ast.slice
-      if isinstance(slic.value, ast.Tuple):
-        # Multiple argument indexing
-        if len(slic.value.elts) == 0:
-          raise ValueError("Indexed defined array with empty "
-                           "tuple instead of affine expression")
-        if len(slic.value.elts) == 1:
-          target_str = astor.to_source(slic.value.elts[0])[:-1]
-        else:
-          target_str = astor.to_source(slic)[1:-2]
-      else:
-        # Single argument indexing
-        target_str = astor.to_source(slic)[:-1]
-      read_map_str = "[{}] -> {{ [{}] -> [{}] : }}".format(
-          ",".join(stmt.param_space_names), ",".join(stmt.domain_space_names),
-          target_str)
-      read_map = islpy.BasicMap.read_from_str(prog.ctx, read_map_str)
+      read_map = ir.read_ast_to_map(read_ast, prog.ctx, stmt.domain_space_names,
+                                    stmt.param_space_names,
+                                    affine_expr_collector.annotation)
       read_map = read_map.intersect_domain(stmt.domain).set_tuple_name(
           islpy.dim_type.in_,
           stmt_id_name).set_tuple_name(islpy.dim_type.out, read_ast.value.id)
@@ -123,7 +106,7 @@ def inject_reduction_barrier_statements(
   """
   new_prog = copy.deepcopy(prog)
   barrier_map: BarrierMap = {}
-  for stmt_id, _, stmt in iter_named_statements(prog):
+  for stmt_id, _, stmt in prog.iter_named_statements():
     if stmt.is_reduction:
       intermediate_lhs_array_name = "_{}_".format(stmt.lhs_array_name)
       new_prog.get_statement_by_id(
@@ -146,7 +129,7 @@ def program_get_domain(prog: ir.Program) -> islpy.UnionSet:
       islpy.Space.create_from_names(prog.ctx,
                                     set=[],
                                     params=prog.param_space_names))
-  for _, stmt_id_name, stmt in iter_named_statements(prog):
+  for _, stmt_id_name, stmt in prog.iter_named_statements():
     instance_set = instance_set.union(stmt.domain.set_tuple_name(stmt_id_name))
   return instance_set
 
@@ -188,7 +171,7 @@ def schedule_isl_ast_gen(
     barrier_stmt_ids = set(barrier_map.values())
     to_remove_statements = {
         stmt_id_name
-        for stmt_id, stmt_id_name, stmt in iter_named_statements(prog)
+        for stmt_id, stmt_id_name, stmt in prog.iter_named_statements()
         if stmt_id in barrier_stmt_ids
     }
     schedule_map = schedule_map.remove_map_if(

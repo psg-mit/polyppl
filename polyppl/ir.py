@@ -18,6 +18,7 @@ import symtable
 import re
 import copy
 from functools import reduce
+from collections import defaultdict
 
 from ordered_set import OrderedSet
 
@@ -30,7 +31,6 @@ import astor
 import ast_scope
 
 from polyppl.isl_utils import align_with_ids
-from polyppl.isl_patch import isl_ast_node_block_get_children
 
 VarID = NewType("VarID", str)
 ArrayID = NewType("ArrayID", str)
@@ -142,9 +142,69 @@ def ast_replace_free_vars(node: ast.Expression,
   return node
 
 
-################################################################################
-#    BEGIN Statement
-################################################################################
+class AffineExpresionCollector(astor.TreeWalk):
+
+  ExpressionKind = enum.Enum("ExpressionType", "affine_l1 affine_l2 non_affine")
+  AnnotationMap = Dict[VarID, ExpressionKind]
+
+  def __init__(self,
+               domain_space_names: List[VarID],
+               node: ast.Expression,
+               scope_info=None,
+               *args,
+               **kwargs):
+    if scope_info is None:
+      scope_info = ast_scope.annotate(node)
+    self.scope_info = scope_info
+    self.domain_space_names = set(domain_space_names)
+    self.annotation: AffineExpresionCollector.AnnotationMap = defaultdict(
+        lambda: self.ExpressionKind.non_affine)
+    astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
+
+  def is_affine_l1(self, node):
+    return self.annotation[node] == self.ExpressionKind.affine_l1
+
+  def is_affine_l2(self, node):
+    return self.annotation[node] == self.ExpressionKind.affine_l2
+
+  def is_affine(self, node):
+    return self.annotation[node] != self.ExpressionKind.non_affine
+
+  def post_BinOp(self):
+    node = self.cur_node
+    if not self.is_affine(node.left) or not self.is_affine(node.right):
+      self.annotation[node] = self.ExpressionKind.non_affine
+    elif isinstance(node.op, ast.Add) or isinstance(node.op, ast.Sub):
+      if self.is_affine_l2(node.left) or self.is_affine_l2(node.right):
+        self.annotation[node] = self.ExpressionKind.affine_l2
+      else:
+        self.annotation[node] = self.ExpressionKind.affine_l1
+    elif isinstance(node.op, ast.Mult):
+      if self.is_affine_l2(node.left) and self.is_affine_l2(node.right):
+        self.annotation[node] = self.ExpressionKind.non_affine
+      elif self.is_affine_l1(node.left) and self.is_affine_l1(node.right):
+        self.annotation[node] = self.ExpressionKind.affine_l1
+      else:
+        self.annotation[node] = self.ExpressionKind.affine_l2
+    elif isinstance(node.op, ast.FloorDiv):
+      if self.is_affine_l1(node.right):
+        self.annotation[node] = self.annotation[node.left]
+      else:
+        self.annotation[node] = self.ExpressionKind.non_affine
+    else:
+      self.annotation[node] = self.ExpressionKind.non_affine
+
+  def post_Name(self):
+    node = self.cur_node
+    if isinstance(self.scope_info[node], ast_scope.scope.GlobalScope):
+      if node.id in self.domain_space_names:
+        self.annotation[node] = self.ExpressionKind.affine_l2
+        return
+    self.annotation[node] = self.ExpressionKind.non_affine
+
+  def post_Num(self):
+    node = self.cur_node
+    self.annotation[node] = self.ExpressionKind.affine_l1
 
 
 def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
@@ -194,6 +254,74 @@ def multi_aff_to_ast(multiaff: islpy.MultiAff,
     aff_ast = aff_to_ast(aff, domain_space_names)
     aff_asts.append(aff_ast)
   return aff_asts
+
+
+def ast_to_aff(ast: ast.AST, ctx: islpy.Context,
+               domain_space_names: List[VarID],
+               param_space_names: List[VarID]) -> islpy.Aff:
+  ast_str = astor.to_source(ast)
+  aff_str = "[{}] -> {{ [{}] -> [{}] }}".format(",".join(param_space_names),
+                                                ",".join(domain_space_names),
+                                                ast_str)
+  return islpy.Aff.read_from_str(ctx, aff_str)
+
+
+def asts_to_multi_aff(asts: List[ast.AST], ctx: islpy.Context,
+                      domain_space_names: List[VarID],
+                      param_space_names: List[VarID]) -> islpy.MultiAff:
+  aff_list = islpy.AffList.alloc(ctx, len(asts))
+  for ast in asts:
+    aff_list.add(ast_to_aff(ast, ctx, domain_space_names, param_space_names))
+  return islpy.MultiAff.from_aff_list(
+      islpy.Space.create_from_names(ctx,
+                                    in_=domain_space_names,
+                                    params=param_space_names), aff_list)
+
+
+def read_ast_to_map(
+    read_ast: ast.AST, ctx: islpy.Context, domain_space_names: List[VarID],
+    param_space_names: List[VarID],
+    affine_annotation: AffineExpresionCollector.AnnotationMap
+) -> islpy.BasicMap:
+  if not isinstance(read_ast, ast.Subscript):
+    raise TypeError("Invalid AST type")
+
+  slic = read_ast.slice
+  if isinstance(slic.value, ast.Tuple):
+    # Multiple argument indexing
+    if len(slic.value.elts) == 0:
+      raise ValueError("Indexed defined array with empty "
+                       "tuple is not allowed")
+    else:
+      targets = slic.value.elts
+  else:
+    # Single argument indexing
+    targets = [slic.value]
+
+  ret_bm = islpy.BasicMap.universe(
+      islpy.Space.create_from_names(ctx,
+                                    in_=domain_space_names,
+                                    out=[],
+                                    params=param_space_names))
+  for target in targets:
+    if affine_annotation[
+        target] == AffineExpresionCollector.ExpressionKind.non_affine:
+      bm_new_dim = islpy.BasicMap.universe(
+          islpy.Space.create_from_names(ctx,
+                                        in_=domain_space_names,
+                                        out=["_"],
+                                        params=param_space_names))
+    else:
+      aff = ast_to_aff(target, ctx, domain_space_names, param_space_names)
+      bm_new_dim = islpy.BasicMap.from_aff(aff)
+    ret_bm = ret_bm.flat_range_product(bm_new_dim)
+
+  return ret_bm
+
+
+################################################################################
+#    BEGIN Statement
+################################################################################
 
 
 class Statement(object):
@@ -415,6 +543,10 @@ class Program(object):
                     lhs_proj,
                     op=op))
     return prog
+
+  def iter_named_statements(self) -> Iterator[str]:
+    for stmt_id, stmt in self.statements.items():
+      yield stmt_id, "S{}".format(stmt_id), stmt
 
   def __repr__(self):
     s = ""

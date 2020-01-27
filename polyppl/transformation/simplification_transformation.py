@@ -1,17 +1,21 @@
 """Simplifcation Transformation."""
 
-import islpy
+from typing import Callable, List, Dict, Set, Optional, Tuple
 
-from typing import Callable, List
-
+import enum
 import copy
 import ast
-import astor
+from collections import defaultdict
 
-from polyppl.isl_utils import aff_align_in_ids
+import ast_scope
+import astor
+import islpy
+
+from polyppl.isl_utils import aff_align_in_ids, basic_set_zero
 import polyppl.ir as ir
 import polyppl.schedule as schedule
 import polyppl.code_gen as code_gen
+import polyppl.isl_utils as isl_utils
 
 
 def _make_subscript_ast(lhs_name: ir.VarID, rhs_asts: List[ast.AST]):
@@ -30,7 +34,7 @@ def _make_simple_subscript_ast(lhs_name: ir.VarID, rhs_names: List[ir.VarID]):
 
 def simplification_transformation(prog: ir.Program,
                                   stmt_id: ir.Program.StatementID,
-                                  r_e: islpy.MultiAff) -> ir.Program:
+                                  r_e: islpy.MultiVal) -> ir.Program:
   """Apply Simplification Transformation with given reuse direction."""
 
   inverse_op_map = {"+": "-", "*": "//"}
@@ -44,6 +48,8 @@ def simplification_transformation(prog: ir.Program,
 
   lhs_proj_map = reduction.lhs_proj_map
 
+  r_e = islpy.MultiAff.multi_val_on_space(r_e.get_space(), r_e)
+  r_e = r_e.add(r_e.identity_multi_aff())
   r_e = r_e.align_params(D_E.get_space())
   r_e_map = islpy.BasicMap.from_multi_aff(r_e)
 
@@ -60,6 +66,17 @@ def simplification_transformation(prog: ir.Program,
 
   lhs_space_tmp_var_names = ir.tmp_vars(num=reduction.lhs_domain.n_dim())
 
+  # Project r_e_map onto lhs space
+  r_f_map = r_e_map.apply_domain(lhs_proj_map).apply_range(lhs_proj_map)
+  if r_f_map.is_identity():
+    raise ValueError("shift must not be in ker(f_p)")
+  r_f = islpy.PwMultiAff.from_map(r_f_map)
+  assert r_f.n_piece() == 1, ("Something is wrong with r_f"
+                              "it should only have 1 piece")
+  r_f = r_f.as_multi_aff()
+  # No need to check again here
+  r_rev_f = islpy.PwMultiAff.from_map(r_f_map.reverse()).as_multi_aff()
+
   X_add_name = ir.ArrayID(reduction.lhs_array_name + "_add")
   X_add_domain = D_E.subtract(D_E_p)
   X_add_access = _make_simple_subscript_ast(X_add_name, lhs_space_tmp_var_names)
@@ -74,7 +91,7 @@ def simplification_transformation(prog: ir.Program,
 
   X_sub_name = ir.ArrayID(reduction.lhs_array_name + "_sub")
   X_sub_domain = D_int.apply(lhs_proj_map.reverse()).intersect(
-      D_E_p.subtract(D_E))
+      D_E_p.subtract(D_E)).apply(r_e_map)
   X_sub_access = _make_simple_subscript_ast(X_sub_name, lhs_space_tmp_var_names)
 
   if not X_sub_domain.is_empty():
@@ -83,17 +100,11 @@ def simplification_transformation(prog: ir.Program,
     for X_sub_domain_basic in X_sub_domain.get_basic_sets():
       X_sub_stmt = ir.Statement(X_sub_domain_basic, reduction.param_space_names,
                                 reduction.domain_space_names, X_sub_name,
-                                reduction.rhs, reduction.lhs_proj, reduction.op,
-                                reduction.non_affine_constraints)
+                                reduction.rhs,
+                                r_rev_f.pullback_multi_aff(reduction.lhs_proj),
+                                reduction.op, reduction.non_affine_constraints)
       prog.add_statement(X_sub_stmt)
 
-  r_f_map = r_e_map.apply_domain(lhs_proj_map).apply_range(lhs_proj_map)
-  if r_f_map.is_identity():
-    raise ValueError("shift must not be in ker(f_p)")
-  r_f = islpy.PwMultiAff.from_map(r_f_map)
-  assert r_f.n_piece() == 1, ("Something is wrong with r_f"
-                              "it should only have 1 piece")
-  r_f = r_f.as_multi_aff()
   index_args = ir.multi_aff_to_ast(r_f, lhs_space_tmp_var_names)
   shifted_X_access = _make_subscript_ast(reduction.lhs_array_name, index_args)
 
@@ -144,19 +155,155 @@ def simplification_transformation(prog: ir.Program,
   return prog
 
 
+LhsReuseSpaceMapType = Dict[ir.VarID, islpy.BasicSet]
+RhsReuseSpaceMapType = Dict[int, islpy.BasicSet]
+
+
+class ReuseSpaceCollector(astor.TreeWalk):
+
+  def __init__(
+      self,
+      ctx: islpy.Context,
+      domain_space_names: List[ir.VarID],
+      param_space_names: List[ir.VarID],
+      affine_annotation: Dict[ast.AST,
+                              ir.AffineExpresionCollector.ExpressionKind],
+      reads: Set[ast.AST],
+      lhs_reuse_space_map: LhsReuseSpaceMapType,
+      node: Optional[ast.Expression] = None,
+      *args,
+      **kwargs):
+    self.ctx = ctx
+    self.domain_space_names = domain_space_names
+    self.param_space_names = param_space_names
+    self.reuse_space = islpy.Space.create_from_names(ctx,
+                                                     set=domain_space_names,
+                                                     params=param_space_names)
+    self.default_reuse_space_set = basic_set_zero(self.reuse_space)
+    self.lhs_reuse_space_map = defaultdict(lambda: self.default_reuse_space_set,
+                                           lhs_reuse_space_map)
+    self.reads = reads
+    self.reuse_space_set = islpy.BasicSet.universe(self.reuse_space)
+    self.affine_annotation = affine_annotation
+    astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
+
+  def pre_any_node(self):
+    node = self.cur_node
+    if ((isinstance(node, ast.AST) and self.affine_annotation[node] !=
+         ir.AffineExpresionCollector.ExpressionKind.non_affine) and
+        (not isinstance(self.parent, ast.AST) or
+         self.affine_annotation[self.parent] ==
+         ir.AffineExpresionCollector.ExpressionKind.non_affine)):
+      aff = ir.ast_to_aff(node, self.ctx, self.domain_space_names,
+                          self.param_space_names)
+      reuse_space_map = aff.eq_map(aff).get_basic_maps()[0]
+      reuse_space_set = self.default_reuse_space_set.apply(reuse_space_map)
+      self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
+      return True
+
+  def post_any_node(self):
+    pass
+
+  class PatchedDict(defaultdict):
+
+    def get(self, key, default=None):
+      if default is not None:
+        return super().get(key, default)
+      else:
+        return self[key]
+
+  def setup(self):
+    astor.TreeWalk.setup(self)
+    self.pre_handlers = ReuseSpaceCollector.PatchedDict(
+        lambda: self.pre_any_node, self.pre_handlers)
+    self.post_handlers = ReuseSpaceCollector.PatchedDict(
+        lambda: self.post_any_node, self.post_handlers)
+
+  def pre_Subscript(self):
+    if self.cur_node in self.reads:
+      read = self.cur_node
+      array_ref_reuse_space_set = self.lhs_reuse_space_map[read.value.id]
+      read_map = ir.read_ast_to_map(read, self.ctx, self.domain_space_names,
+                                    self.param_space_names,
+                                    self.affine_annotation)
+      reuse_space_set = array_ref_reuse_space_set.apply(read_map.reverse())
+      self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
+      return True
+
+
+def compute_reuse_space_for_statement(
+    stmt: ir.Statement, declared_lhs_symbols: Set[ir.VarID],
+    reuse_space_map: LhsReuseSpaceMapType) -> islpy.BasicSet:
+  affine_expr_collector = ir.AffineExpresionCollector(stmt.domain_space_names,
+                                                      stmt.rhs)
+  reads = schedule.ASTCollectRead(stmt.rhs, declared_lhs_symbols).reads
+  reuse_space_collector = ReuseSpaceCollector(stmt.domain.get_ctx(),
+                                              stmt.domain_space_names,
+                                              stmt.param_space_names,
+                                              affine_expr_collector.annotation,
+                                              reads,
+                                              reuse_space_map,
+                                              node=stmt.rhs)
+  return reuse_space_collector.reuse_space_set
+
+
+def compute_reuse_space_one_pass(
+    prog: ir.Program,
+    lhs_reuse_space_map: LhsReuseSpaceMapType,
+) -> Tuple[LhsReuseSpaceMapType, RhsReuseSpaceMapType]:
+  updated_lhs_symbols = set()
+  rhs_reuse_space_map = {}
+  declared_lhs_symbols = {
+      stmt.lhs_array_name for stmt in prog.statements.values()
+  }
+  for stmt_id, _, stmt in prog.iter_named_statements():
+    rs = compute_reuse_space_for_statement(stmt, declared_lhs_symbols,
+                                           lhs_reuse_space_map)
+    rhs_reuse_space_map[stmt_id] = rs
+    rs = rs.apply(stmt.lhs_proj_map)
+    if stmt.lhs_array_name not in updated_lhs_symbols:
+      lhs_reuse_space_map[stmt.lhs_array_name] = rs
+      updated_lhs_symbols.add(stmt.lhs_array_name)
+    else:
+      lhs_reuse_space_map[stmt.lhs_array_name] = lhs_reuse_space_map[
+          stmt.lhs_array_name].intersect(rs)
+  return lhs_reuse_space_map, rhs_reuse_space_map
+
+
+def compute_reuse_space(
+    prog: ir.Program) -> Tuple[LhsReuseSpaceMapType, RhsReuseSpaceMapType]:
+  lhs_reuse_space_map, rhs_reuse_space_map = {}, {}
+  changed = True
+  while changed:
+    lhs_reuse_space_map, new_rhs_reuse_space_map = compute_reuse_space_one_pass(
+        prog, lhs_reuse_space_map)
+    changed = new_rhs_reuse_space_map == rhs_reuse_space_map
+    rhs_reuse_space_map = new_rhs_reuse_space_map
+  return lhs_reuse_space_map, rhs_reuse_space_map
+
+
+def sample_non_zero_reuse_vector(reuse_set: islpy.BasicSet) -> islpy.MultiVal:
+  point = reuse_set.subtract(isl_utils.basic_set_zero(
+      reuse_set.get_space())).sample_point()
+  return isl_utils.point_to_multi_val(point)
+
+
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
   N
-  A[i] += f(B[j])     # { [i, j] : 0 <= i < N & 0 <= j < i } ;
+  A[i] += f(B[j - i])     # { [i, j] : 0 <= i < N & 0 <= j < i } ;
   """)
+  _, reuse_space_map = compute_reuse_space(prog)
+  stmt_id = 0
+  print(sample_non_zero_reuse_vector(reuse_space_map[stmt_id]))
   new_prog1 = simplification_transformation(
-      prog, 0, islpy.MultiAff.read_from_str(prog.ctx, "{ [i, j] -> [i-1, j] }"))
+      prog, stmt_id, sample_non_zero_reuse_vector(reuse_space_map[stmt_id]))
   new_prog2, barrier_map = schedule.inject_reduction_barrier_statements(
       new_prog1)
   # new_prog, barrier_map = prog, None
-  schedule = schedule.schedule_program(new_prog2)
+  sched = schedule.schedule_program(new_prog2)
   isl_ast = schedule.schedule_isl_ast_gen(new_prog2,
-                                          schedule,
+                                          sched,
                                           barrier_map=barrier_map)
   cgen_ast = code_gen.isl_ast_code_gen(new_prog1, isl_ast)
   # print(astor.dump_tree(cgen_ast))

@@ -40,3 +40,20 @@ def set_all_tuple_names(umap, dim, name):
 
   umap.foreach_map(set_name)
   return ret
+
+
+def basic_set_zero(space: islpy.Space):
+  """Returns set at zero, but without adding constraints on the parameters"""
+  bs = islpy.BasicSet.universe(space)
+  for i in range(bs.n_dim()):
+    bs = bs.fix_val(islpy.dim_type.set, i, islpy.Val.zero(bs.get_ctx()))
+  return bs
+
+
+def point_to_multi_val(point: islpy.Point) -> islpy.MultiVal:
+  ndim = point.get_space().dim(islpy.dim_type.set)
+  vallist = islpy.ValList.alloc(point.get_ctx(), ndim)
+  for i in range(ndim):
+    val = point.get_coordinate_val(islpy.dim_type.set, i)
+    vallist = vallist.add(val)
+  return islpy.MultiVal.from_val_list(point.get_space(), vallist)
