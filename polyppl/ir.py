@@ -546,9 +546,12 @@ class Program(object):
                     op=op))
     return prog
 
+  def stmt_name(self, stmt_id: StatementID):
+    return "S{}".format(stmt_id)
+
   def iter_named_statements(self) -> Iterator[Tuple[int, str, Statement]]:
     for stmt_id, stmt in self.statements.items():
-      yield stmt_id, "S{}".format(stmt_id), stmt
+      yield stmt_id, self.stmt_name(stmt_id), stmt
 
   def __repr__(self):
     s = ""

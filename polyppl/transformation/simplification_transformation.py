@@ -224,10 +224,13 @@ class ReuseSpaceCollector(astor.TreeWalk):
   def pre_Subscript(self):
     if self.cur_node in self.reads:
       read = self.cur_node
-      array_ref_reuse_space_set = self.lhs_reuse_space_map[read.value.id]
       read_map = ir.read_ast_to_map(read, self.ctx, self.domain_space_names,
                                     self.param_space_names,
                                     self.affine_annotation)
+      if read.value.id not in self.lhs_reuse_space_map:
+        self.lhs_reuse_space_map[read.value.id] = basic_set_zero(
+            read_map.range().get_space())
+      array_ref_reuse_space_set = self.lhs_reuse_space_map[read.value.id]
       reuse_space_set = array_ref_reuse_space_set.apply(read_map.reverse())
       self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
       return True
@@ -262,6 +265,9 @@ def compute_reuse_space_one_pass(
     prog: ir.Program,
     lhs_reuse_space_map: LhsReuseSpaceMapType,
 ) -> Tuple[LhsReuseSpaceMapType, RhsReuseSpaceMapType]:
+  """Computes reuse space for program by traversing top-down through statements.
+  """
+  lhs_reuse_space_map = dict(lhs_reuse_space_map)
   updated_lhs_symbols = set()
   rhs_reuse_space_map = {}
   declared_lhs_symbols = {
@@ -270,6 +276,7 @@ def compute_reuse_space_one_pass(
   for stmt_id, _, stmt in prog.iter_named_statements():
     rs = compute_reuse_space_for_statement(stmt, declared_lhs_symbols,
                                            lhs_reuse_space_map)
+
     rhs_reuse_space_map[stmt_id] = rs
     if stmt.is_reduction:
       lhs_rs = compute_reduction_lhs_reuse_space(stmt, rs)
@@ -289,13 +296,26 @@ def compute_reuse_space_one_pass(
 
 def compute_reuse_space(
     prog: ir.Program) -> Tuple[LhsReuseSpaceMapType, RhsReuseSpaceMapType]:
+  """Computes reuse space for program.
+
+  The routine iteratively invokes `compute_reuse_space_one_pass`
+  until convergence.
+
+  Args:
+    prog: input program
+
+  Returns:
+    A tuple of mapping for LHS reuse space and RHS reuse space.
+  """
   lhs_reuse_space_map, rhs_reuse_space_map = {}, {}
   changed = True
   while changed:
-    lhs_reuse_space_map, new_rhs_reuse_space_map = compute_reuse_space_one_pass(
+    new_lhs_reuse_space_map, new_rhs_reuse_space_map = compute_reuse_space_one_pass(
         prog, lhs_reuse_space_map)
-    changed = new_rhs_reuse_space_map == rhs_reuse_space_map
-    rhs_reuse_space_map = new_rhs_reuse_space_map
+    changed = (new_lhs_reuse_space_map, new_rhs_reuse_space_map) != (
+        lhs_reuse_space_map, rhs_reuse_space_map)
+    lhs_reuse_space_map, rhs_reuse_space_map = (new_lhs_reuse_space_map,
+                                                new_rhs_reuse_space_map)
   return lhs_reuse_space_map, rhs_reuse_space_map
 
 
@@ -315,24 +335,78 @@ def sample_non_zero_reuse_vector_for_statement(
   return sample_non_zero_vector_from_reuse_set(reuse_set.subtract(proj_kernel))
 
 
+def sample_non_zero_reuse_vector_for_statement_with_correct_dependence(
+    prog: ir.Program, stmt_id: int, reuse_space_map: RhsReuseSpaceMapType,
+    barrier_map: schedule.BarrierMap, sched: islpy.Schedule) -> islpy.MultiVal:
+  """Samples non zero reuse vector that satisfies the original schedule.
+
+  Args:
+    prog: input program with injected barrier statements.
+    stmt_id: target statement this ST is applying to.
+    reuse_space_map: reuse space mapping for RHS expressions.
+    barrier_map: barrier map for the injected statements.
+    sched: ISL schedule for `prog`
+
+  Returns:
+    a reuse direction that is valid with respect to the schedule.
+  """
+  r_e = sample_non_zero_reuse_vector_for_statement(prog, stmt_id,
+                                                   reuse_space_map)
+  schedule_map = sched.get_map()
+  barrier_stmt_name = prog.stmt_name(barrier_map[stmt_id])
+  stmt = prog.get_statement_by_id(stmt_id)
+  r_e_bs = islpy.BasicSet.from_multi_aff(
+      islpy.MultiAff.multi_val_on_space(r_e.get_domain_space(), r_e))
+  r_e_lhs = r_e_bs.apply(stmt.lhs_proj_map).set_tuple_name(barrier_stmt_name)
+  test_vec = r_e_lhs.apply(schedule_map)
+  test_vec_bs_list = test_vec.get_basic_set_list()
+  if test_vec_bs_list.n_basic_set() != 1:
+    raise ValueError("Invalid schedule")
+  test_vec = test_vec_bs_list.get_at(0)
+  if not test_vec.is_singleton():
+    raise ValueError("Invalid schedule")
+  test_point = test_vec.sample_point()
+  for i in range(test_point.get_space().dim(islpy.dim_type.set)):
+    coord_val = test_point.get_coordinate_val(islpy.dim_type.set, i).to_python()
+    if coord_val != 0:
+      dep_satisfied = coord_val < 0
+      break
+  if not dep_satisfied:
+    r_e = r_e.neg()
+  return r_e
+
+
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
-  N M
-  A[i] += 1     # { [i, j, k] : 0 <= i < N & 0 <= j < M & 0 <= k < M } ;
+  N
+  A[i] += B[j]     # { [j, i] : 0 <= i < N & 0 <= j < i} ;
+  B[i] = f(A[i])   # { [i] : 0 <= i < N };
   """)
   _, reuse_space_map = compute_reuse_space(prog)
   stmt_id = 0
-  r_e = sample_non_zero_reuse_vector_for_statement(prog, stmt_id,
-                                                   reuse_space_map)
-  print(r_e)
-  new_prog1 = simplification_transformation(prog, stmt_id, r_e)
-  new_prog2, barrier_map = schedule.inject_reduction_barrier_statements(
-      new_prog1)
+  # r_e = sample_non_zero_reuse_vector_for_statement(prog, stmt_id,
+  #                                                  reuse_space_map)
+  # print(r_e)
+  # new_prog1 = simplification_transformation(prog, stmt_id, r_e)
+  barrier_prog, barrier_map = schedule.inject_reduction_barrier_statements(prog)
   # new_prog, barrier_map = prog, None
-  sched = schedule.schedule_program(new_prog2)
-  isl_ast = schedule.schedule_isl_ast_gen(new_prog2,
+  sched = schedule.schedule_program(barrier_prog)
+  isl_ast = schedule.schedule_isl_ast_gen(prog, sched, barrier_map=barrier_map)
+  cgen_ast = code_gen.isl_ast_code_gen(prog, isl_ast)
+  print(astor.to_source(cgen_ast))
+
+  # Perform ST
+  r_e = sample_non_zero_reuse_vector_for_statement_with_correct_dependence(
+      barrier_prog, stmt_id, reuse_space_map, barrier_map, sched)
+  st_prog = simplification_transformation(prog, stmt_id, r_e)
+
+  # Generate ST transformed code
+  barrier_st_prog, barrier_map = schedule.inject_reduction_barrier_statements(
+      st_prog)
+  sched = schedule.schedule_program(barrier_st_prog)
+  isl_ast = schedule.schedule_isl_ast_gen(st_prog,
                                           sched,
                                           barrier_map=barrier_map)
-  cgen_ast = code_gen.isl_ast_code_gen(new_prog1, isl_ast)
+  cgen_ast = code_gen.isl_ast_code_gen(st_prog, isl_ast)
   # print(astor.dump_tree(cgen_ast))
   print(astor.to_source(cgen_ast))
