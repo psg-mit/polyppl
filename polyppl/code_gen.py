@@ -19,10 +19,14 @@ def code_gen_exp(node: islpy.AstExpr) -> ast.AST:
   # this should not work for certain op type
   c_str = node.to_C_str().replace("&&", "and").replace("||",
                                                        "or").replace("/", "//")
-  return ast.parse(c_str, mode="eval").body
+  expr: ast.Expression = ast.parse(c_str, mode="eval")
+  return expr.body
 
 
-def code_gen_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+CodeGenRetType = Union[ast.AST, List[ast.AST]]
+
+
+def code_gen_node(prog: ir.Program, node: islpy.AstNode) -> CodeGenRetType:
   node_type = node.get_type()
   if node_type == islpy.ast_node_type.block:
     return code_gen_block_node(prog, node)
@@ -36,7 +40,8 @@ def code_gen_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
     raise ValueError("Codegen encountered unsupported node type")
 
 
-def code_gen_block_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+def code_gen_block_node(prog: ir.Program,
+                        node: islpy.AstNode) -> CodeGenRetType:
   ret = []
   block_inner_list = node.block_get_children()
   for i in range(block_inner_list.n_ast_node()):
@@ -55,7 +60,7 @@ def listify_ast(ast: Union[List[ast.AST], ast.AST]) -> List[ast.AST]:
     return [ast]
 
 
-def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> CodeGenRetType:
   """Generate ast for a loop node.
 
   This routine attempts to generate a for-range loop whenever possible (which
@@ -138,7 +143,7 @@ def code_gen_for_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
     return [init_ast, ast.While(test=cond_ast, body=loop_body_ast, orelse=[])]
 
 
-def code_gen_if_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+def code_gen_if_node(prog: ir.Program, node: islpy.AstNode) -> CodeGenRetType:
   """Generate ast for a condition node."""
   cond_exp = node.if_get_cond()
   cond_ast = code_gen_exp(cond_exp)
@@ -155,7 +160,7 @@ def code_gen_if_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
   return ast.If(test=cond_ast, body=then_ast, orelse=else_ast)
 
 
-def code_gen_user_node(prog: ir.Program, node: islpy.AstNode) -> ast.AST:
+def code_gen_user_node(prog: ir.Program, node: islpy.AstNode) -> CodeGenRetType:
   """Generate ast for a user node."""
   user_exp_node = node.user_get_expr()
   if (user_exp_node.get_type() != islpy.ast_expr_type.op or

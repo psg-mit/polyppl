@@ -82,6 +82,7 @@ def simplification_transformation(prog: ir.Program,
   X_add_access = _make_simple_subscript_ast(X_add_name, lhs_space_tmp_var_names)
 
   if not X_add_domain.is_empty():
+    X_add_domain = X_add_domain.make_disjoint()
     for X_add_domain_basic in X_add_domain.get_basic_sets():
       X_add_stmt = ir.Statement(X_add_domain_basic, reduction.param_space_names,
                                 reduction.domain_space_names, X_add_name,
@@ -97,6 +98,7 @@ def simplification_transformation(prog: ir.Program,
   if not X_sub_domain.is_empty():
     if reduction.op not in inverse_op_map:
       raise ValueError("Operator must have an inverse to have non-empty D_sub")
+    X_sub_domain = X_sub_domain.make_disjoint()
     for X_sub_domain_basic in X_sub_domain.get_basic_sets():
       X_sub_stmt = ir.Statement(X_sub_domain_basic, reduction.param_space_names,
                                 reduction.domain_space_names, X_sub_name,
@@ -247,6 +249,15 @@ def compute_reuse_space_for_statement(
   return reuse_space_collector.reuse_space_set
 
 
+def compute_reduction_lhs_reuse_space(
+    stmt: ir.Statement, rhs_reuse_space: islpy.BasicSet) -> islpy.BasicSet:
+  non_boundary_constraints = isl_utils.compute_non_boundary_constraint(
+      stmt.domain, stmt.lhs_proj)
+  valid_reuse = isl_utils.bs_from_kernel_of_constraints(
+      rhs_reuse_space.get_space(), non_boundary_constraints)
+  return rhs_reuse_space.intersect(valid_reuse).apply(stmt.lhs_proj_map)
+
+
 def compute_reuse_space_one_pass(
     prog: ir.Program,
     lhs_reuse_space_map: LhsReuseSpaceMapType,
@@ -260,13 +271,19 @@ def compute_reuse_space_one_pass(
     rs = compute_reuse_space_for_statement(stmt, declared_lhs_symbols,
                                            lhs_reuse_space_map)
     rhs_reuse_space_map[stmt_id] = rs
-    rs = rs.apply(stmt.lhs_proj_map)
+    if stmt.is_reduction:
+      lhs_rs = compute_reduction_lhs_reuse_space(stmt, rs)
+      # lineality_space = isl_utils.compute_lineality_space(stmt.domain)
+      # lhs_rs = rs.intersect(lineality_space).apply(stmt.lhs_proj_map)
+    else:
+      lhs_rs = rs
+
     if stmt.lhs_array_name not in updated_lhs_symbols:
-      lhs_reuse_space_map[stmt.lhs_array_name] = rs
+      lhs_reuse_space_map[stmt.lhs_array_name] = lhs_rs
       updated_lhs_symbols.add(stmt.lhs_array_name)
     else:
       lhs_reuse_space_map[stmt.lhs_array_name] = lhs_reuse_space_map[
-          stmt.lhs_array_name].intersect(rs)
+          stmt.lhs_array_name].intersect(lhs_rs)
   return lhs_reuse_space_map, rhs_reuse_space_map
 
 
@@ -282,22 +299,33 @@ def compute_reuse_space(
   return lhs_reuse_space_map, rhs_reuse_space_map
 
 
-def sample_non_zero_reuse_vector(reuse_set: islpy.BasicSet) -> islpy.MultiVal:
+def sample_non_zero_vector_from_reuse_set(
+    reuse_set: islpy.Set) -> islpy.MultiVal:
   point = reuse_set.subtract(isl_utils.basic_set_zero(
       reuse_set.get_space())).sample_point()
   return isl_utils.point_to_multi_val(point)
 
 
+def sample_non_zero_reuse_vector_for_statement(
+    prog: ir.Program, stmt_id: int,
+    reuse_space_map: RhsReuseSpaceMapType) -> islpy.MultiVal:
+  reuse_set = reuse_space_map[stmt_id]
+  stmt = prog.get_statement_by_id(stmt_id)
+  proj_kernel = isl_utils.compute_proj_kernel(stmt.lhs_proj)
+  return sample_non_zero_vector_from_reuse_set(reuse_set.subtract(proj_kernel))
+
+
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
-  N
-  A[i] += f(B[j - i])     # { [i, j] : 0 <= i < N & 0 <= j < i } ;
+  N M
+  A[i] += 1     # { [i, j, k] : 0 <= i < N & 0 <= j < M & 0 <= k < M } ;
   """)
   _, reuse_space_map = compute_reuse_space(prog)
   stmt_id = 0
-  print(sample_non_zero_reuse_vector(reuse_space_map[stmt_id]))
-  new_prog1 = simplification_transformation(
-      prog, stmt_id, sample_non_zero_reuse_vector(reuse_space_map[stmt_id]))
+  r_e = sample_non_zero_reuse_vector_for_statement(prog, stmt_id,
+                                                   reuse_space_map)
+  print(r_e)
+  new_prog1 = simplification_transformation(prog, stmt_id, r_e)
   new_prog2, barrier_map = schedule.inject_reduction_barrier_statements(
       new_prog1)
   # new_prog, barrier_map = prog, None

@@ -82,7 +82,7 @@ class TestIR(PolyPPLTestCaseBase):
       ),
       (
         """
-        A[i] += B[B[j] + (2 * j + i + 5)] # { [i, j] : } ;
+        A[i] += B[B[j] + (2 * j + i + 5)] # { [i, j] : 0 < i < j < 5} ;
         X[i, j] = A[2*i+j] # { [i, j]:  };
         """,
         "{ [i, j] : 2 * i + j = 0 }"
@@ -100,7 +100,14 @@ class TestIR(PolyPPLTestCaseBase):
         X[i, j] = A[i] # { [i, j] };
         """,
         "{ [0, 0] : }"
-      )
+      ),
+      (
+        """N
+        A[i] += B[j] # { [i, j] : 0 <= i < N & 0 <= j};
+        X[i] = A[i] # { [i] };
+        """,
+        "{ [i] : }"
+      ),
     ]
     # yapf: enable
 

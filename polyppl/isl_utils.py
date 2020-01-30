@@ -1,8 +1,11 @@
 """Utilities."""
 
-from typing import Union, Optional, List
+from typing import Union, List, TYPE_CHECKING
 
 import islpy
+
+if TYPE_CHECKING:
+  import polyppl.ir as ir
 
 
 def set_align_dim_ids(set, names):
@@ -20,7 +23,7 @@ def aff_align_in_ids(aff, names):
 
 
 def align_with_ids(obj: Union[islpy.BasicSet, islpy.Set, islpy.Aff,
-                              islpy.MultiAff], names: List[str]):
+                              islpy.MultiAff], names: List["ir.VarID"]):
   if isinstance(obj, islpy.Set) or isinstance(obj, islpy.BasicSet):
     return set_align_dim_ids(obj, names)
   elif isinstance(obj, islpy.MultiAff) or isinstance(obj, islpy.Aff):
@@ -57,3 +60,115 @@ def point_to_multi_val(point: islpy.Point) -> islpy.MultiVal:
     val = point.get_coordinate_val(islpy.dim_type.set, i)
     vallist = vallist.add(val)
   return islpy.MultiVal.from_val_list(point.get_space(), vallist)
+
+
+def compute_lineality_space(bs: islpy.BasicSet) -> islpy.BasicSet:
+  """Computes lineality space of set.
+
+  The lineality space of s := { z | Qz + q >= 0 } is defined as { z | Q z = 0}
+  """
+  dims = [
+      islpy.dim_type.set, islpy.dim_type.div, islpy.dim_type.param,
+      islpy.dim_type.cst
+  ]
+  eq_mat = bs.equalities_matrix(*dims)
+  ineq_mat = bs.inequalities_matrix(*dims)
+
+  n_cst = bs.n_param() + 1
+
+  def drop_cst_col(mat: islpy.Mat) -> islpy.Mat:
+    mat = mat.drop_cols(mat.cols() - n_cst, n_cst)
+    mat = mat.add_zero_cols(n_cst)
+    return mat
+
+  eq_mat = drop_cst_col(eq_mat)
+  ineq_mat = drop_cst_col(ineq_mat)
+  ret_eq_mat = eq_mat.concat(ineq_mat)
+  ret_ineq_mat = islpy.Mat.alloc(bs.get_ctx(), 0, ret_eq_mat.cols())
+
+  return islpy.BasicSet.from_constraint_matrices(bs.get_space(), ret_eq_mat,
+                                                 ret_ineq_mat, *dims)
+
+
+def bs_from_kernel_of_constraints(
+    space: islpy.Space, constraints: List[islpy.Constraint]) -> islpy.BasicSet:
+  """Computes the intersection of all kernels of constraints."""
+  ret = islpy.BasicSet.universe(space)
+  zero = islpy.Val.zero(space.get_ctx())
+  for c in constraints:
+    # Set const and param coeffs to be 0 and create a equality constraint
+    # This effectively means we treat parameteres as constants
+    # and given constraint Qz + q >=0, we use kernel(Q) as our L_p constraint
+    kernel_constraint = islpy.Constraint.equality_from_aff(
+        c.get_aff().set_constant_val(zero).set_coefficients(
+            islpy.dim_type.param, [zero] * space.dim(islpy.dim_type.param)))
+    ret = ret.add_constraint(kernel_constraint)
+  return ret
+
+
+def compute_effective_linear_space(bs: islpy.BasicSet) -> islpy.BasicSet:
+  r"""Compute the space where bs is unbounded.
+
+  The linear space L_p for P = {z | Qz + q >= 0} is defined as the set of
+  vectors v such that for all k, P \cap shift(P, k+v) != empty.
+  Intuitively, this is the set of vectors where P spans indefinitely (where we
+  consider P's parameters to be possibiliy infinite).
+  """
+  effective_saturated_constraints = []
+  for constraint in bs.get_constraints():
+    aff = constraint.get_aff()
+    tau = bs.max_val(aff)
+    if not tau.is_infty():
+      effective_saturated_constraints.append(constraint)
+  return bs_from_kernel_of_constraints(bs.get_space(),
+                                       effective_saturated_constraints)
+
+
+def compute_saturated_constraints(bs: islpy.BasicSet) -> List[islpy.Constraint]:
+  ret = []
+  for c in bs.get_constraints():
+    if c.is_equality():
+      ret.append(c)
+    else:
+      bs_test = bs.add_constraint(
+          islpy.Constraint.inequality_from_aff(c.get_aff().neg()))
+      if bs_test == bs:
+        ret.append(c)
+  return ret
+
+
+def compute_proj_kernel(proj: islpy.MultiVal) -> islpy.BasicSet:
+  proj_map = islpy.BasicMap.from_multi_aff(proj)
+  proj_kernel = basic_set_zero(proj_map.get_space().range()).apply(
+      proj_map.reverse())
+  return proj_kernel
+
+
+def compute_boundary_constraint(bs: islpy.BasicSet,
+                                proj: islpy.MultiAff,
+                                non_boundary=False) -> List[islpy.Constraint]:
+  proj_kernel = compute_proj_kernel(proj)
+  saturated_constraints = compute_saturated_constraints(bs)
+  hp = bs_from_kernel_of_constraints(bs.get_space(), saturated_constraints)
+  boundary_constraints = []
+  for c in bs.get_constraints():
+    c_kernel = bs_from_kernel_of_constraints(bs.get_space(), [c])
+    is_boundary = hp.intersect(c_kernel).is_subset(hp.intersect(proj_kernel))
+    if non_boundary != is_boundary:
+      boundary_constraints.append(c)
+  return boundary_constraints
+
+
+def compute_non_boundary_constraint(
+    bs: islpy.BasicSet, proj: islpy.MultiAff) -> List[islpy.Constraint]:
+  return compute_boundary_constraint(bs, proj, True)
+
+
+if __name__ == "__main__":
+  ctx = islpy.Context()
+  a = islpy.BasicSet.read_from_str(
+      ctx, "[N, M] -> {[i, j] : 0 <= i < N & 0 < j < M}")
+  proj = islpy.MultiAff.read_from_str(ctx, "[N, M] -> { [i, j] -> [i] }")
+  # b = compute_lineality_space(a)
+  # print(b)
+  print(compute_non_boundary_constraint(a, proj))

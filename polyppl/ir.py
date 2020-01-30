@@ -490,7 +490,9 @@ class Program(object):
     except lark.exceptions.LarkError:
       raise Program.ProgramParseError("Cannot parse")
 
-    params = [str(param) for param in safe_find_data(ir_ast, "params").children]
+    params = [
+        VarID(param) for param in safe_find_data(ir_ast, "params").children
+    ]
     program_ast = next(ir_ast.find_data("program"))
     statements_ast = program_ast.children
 
@@ -544,7 +546,7 @@ class Program(object):
                     op=op))
     return prog
 
-  def iter_named_statements(self) -> Iterator[str]:
+  def iter_named_statements(self) -> Iterator[Tuple[int, str, Statement]]:
     for stmt_id, stmt in self.statements.items():
       yield stmt_id, "S{}".format(stmt_id), stmt
 
