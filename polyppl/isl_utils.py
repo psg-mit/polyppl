@@ -45,6 +45,12 @@ def set_all_tuple_names(umap, dim, name):
   return ret
 
 
+def bijective_basic_map_to_multi_aff(bm: islpy.BasicMap) -> islpy.MultiAff:
+  if not bm.is_bijective():
+    raise ValueError("BasicMap is not bijective")
+  return islpy.PwMultiAff.from_map(bm).as_multi_aff()
+
+
 def basic_set_zero(space: islpy.Space):
   """Returns set at zero, but without adding constraints on the parameters"""
   bs = islpy.BasicSet.universe(space)
@@ -125,6 +131,10 @@ def compute_effective_linear_space(bs: islpy.BasicSet) -> islpy.BasicSet:
 
 
 def compute_saturated_constraints(bs: islpy.BasicSet) -> List[islpy.Constraint]:
+  """Computes the saturated constraints.
+
+  A constraint c is saturated if c & P == P.
+  """
   ret = []
   for c in bs.get_constraints():
     if c.is_equality():
@@ -147,6 +157,17 @@ def compute_proj_kernel(proj: islpy.MultiVal) -> islpy.BasicSet:
 def compute_boundary_constraint(bs: islpy.BasicSet,
                                 proj: islpy.MultiAff,
                                 non_boundary=False) -> List[islpy.Constraint]:
+  """Computes boundary constraint of set given project function.
+
+  Args:
+    bs: the input basic set.
+    proj: the input projection represented as a MultiAff.
+    non_boundary: if True, returns the non-boundary constraints instead of the
+      boundary constraints.
+
+  Returns:
+    boundary constraint or non-boundary constraints.
+  """
   proj_kernel = compute_proj_kernel(proj)
   saturated_constraints = compute_saturated_constraints(bs)
   hp = bs_from_kernel_of_constraints(bs.get_space(), saturated_constraints)

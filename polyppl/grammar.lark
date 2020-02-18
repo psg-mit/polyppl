@@ -4,7 +4,7 @@ params: NAME *
 
 program: statement+
 
-statement: lhs_array "[" aff_list "]" [ op ] "=" expression "#" "{" polyhedron "}" ";"
+statement: lhs_array "[" aff_list "]" [ op ] "=" expression "#" "{" polyhedron "}" ["&" non_affine_guards] ";"
 
 lhs_array: NAME
 
@@ -41,11 +41,14 @@ atom_l1: SIGNED_INT
       | "(" aff_expression_l1 ")"
       | atom_l1 "*" atom_l1
 
+
 // Currently these two below are just greedily consuming the input ...
 
 expression: /[^#]+/
 
 polyhedron: /[^}]+/
+
+non_affine_guards: /[^;]+/
 
 OP: "+" | "*" | "max" | "min"
 

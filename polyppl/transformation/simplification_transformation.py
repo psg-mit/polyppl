@@ -2,6 +2,7 @@
 
 from typing import Callable, List, Dict, Set, Optional, Tuple
 
+import abc
 import enum
 import copy
 import ast
@@ -18,18 +19,23 @@ import polyppl.code_gen as code_gen
 import polyppl.isl_utils as isl_utils
 
 
-def _make_subscript_ast(lhs_name: ir.VarID, rhs_asts: List[ast.AST]):
+def _make_subscript_ast(lhs_name: ir.VarID,
+                        rhs_asts: List[ast.AST],
+                        store=True):
   if len(rhs_asts) == 1:
     rhs = rhs_asts[0]
   else:
     rhs = ast.Tuple(elts=rhs_asts)
-  return ast.Subscript(value=ast.Name(id=lhs_name, ctx=ast.Store()),
+  return ast.Subscript(value=ast.Name(id=lhs_name,
+                                      ctx=ast.Store() if store else ast.Load()),
                        slice=ast.Index(value=rhs))
 
 
-def _make_simple_subscript_ast(lhs_name: ir.VarID, rhs_names: List[ir.VarID]):
+def _make_simple_subscript_ast(lhs_name: ir.VarID,
+                               rhs_names: List[ir.VarID],
+                               store=True):
   rhs_asts = [ast.Name(id=name, ctx=ast.Load()) for name in rhs_names]
-  return _make_subscript_ast(lhs_name, rhs_asts)
+  return _make_subscript_ast(lhs_name, rhs_asts, store=store)
 
 
 def simplification_transformation(prog: ir.Program,
@@ -79,7 +85,9 @@ def simplification_transformation(prog: ir.Program,
 
   X_add_name = ir.ArrayID(reduction.lhs_array_name + "_add")
   X_add_domain = D_E.subtract(D_E_p)
-  X_add_access = _make_simple_subscript_ast(X_add_name, lhs_space_tmp_var_names)
+  X_add_access = _make_simple_subscript_ast(X_add_name,
+                                            lhs_space_tmp_var_names,
+                                            store=False)
 
   if not X_add_domain.is_empty():
     X_add_domain = X_add_domain.make_disjoint()
@@ -87,13 +95,16 @@ def simplification_transformation(prog: ir.Program,
       X_add_stmt = ir.Statement(X_add_domain_basic, reduction.param_space_names,
                                 reduction.domain_space_names, X_add_name,
                                 reduction.rhs, reduction.lhs_proj, reduction.op,
-                                reduction.non_affine_constraints)
+                                reduction.non_affine_constraints,
+                                reduction.histograms)
       prog.add_statement(X_add_stmt)
 
   X_sub_name = ir.ArrayID(reduction.lhs_array_name + "_sub")
   X_sub_domain = D_int.apply(lhs_proj_map.reverse()).intersect(
       D_E_p.subtract(D_E)).apply(r_e_map)
-  X_sub_access = _make_simple_subscript_ast(X_sub_name, lhs_space_tmp_var_names)
+  X_sub_access = _make_simple_subscript_ast(X_sub_name,
+                                            lhs_space_tmp_var_names,
+                                            store=False)
 
   if not X_sub_domain.is_empty():
     if reduction.op not in inverse_op_map:
@@ -104,11 +115,14 @@ def simplification_transformation(prog: ir.Program,
                                 reduction.domain_space_names, X_sub_name,
                                 reduction.rhs,
                                 r_rev_f.pullback_multi_aff(reduction.lhs_proj),
-                                reduction.op, reduction.non_affine_constraints)
+                                reduction.op, reduction.non_affine_constraints,
+                                reduction.histograms)
       prog.add_statement(X_sub_stmt)
 
   index_args = ir.multi_aff_to_ast(r_f, lhs_space_tmp_var_names)
-  shifted_X_access = _make_subscript_ast(reduction.lhs_array_name, index_args)
+  shifted_X_access = _make_subscript_ast(reduction.lhs_array_name,
+                                         index_args,
+                                         store=False)
 
   def handle_1_case(D, rhs_expression_f: Callable[[], ast.AST]):
     if not D.is_empty():
@@ -161,7 +175,7 @@ LhsReuseSpaceMapType = Dict[ir.VarID, islpy.BasicSet]
 RhsReuseSpaceMapType = Dict[int, islpy.BasicSet]
 
 
-class ReuseSpaceCollector(astor.TreeWalk):
+class ReuseSpaceCollector(ir.AffineExprWalker):
 
   def __init__(
       self,
@@ -175,65 +189,41 @@ class ReuseSpaceCollector(astor.TreeWalk):
       node: Optional[ast.Expression] = None,
       *args,
       **kwargs):
-    self.ctx = ctx
-    self.domain_space_names = domain_space_names
-    self.param_space_names = param_space_names
     self.reuse_space = islpy.Space.create_from_names(ctx,
                                                      set=domain_space_names,
                                                      params=param_space_names)
     self.default_reuse_space_set = basic_set_zero(self.reuse_space)
     self.lhs_reuse_space_map = defaultdict(lambda: self.default_reuse_space_set,
                                            lhs_reuse_space_map)
-    self.reads = reads
     self.reuse_space_set = islpy.BasicSet.universe(self.reuse_space)
-    self.affine_annotation = affine_annotation
-    astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
+    ir.AffineExprWalker.__init__(self,
+                                 ctx,
+                                 domain_space_names,
+                                 param_space_names,
+                                 affine_annotation,
+                                 reads,
+                                 node=node,
+                                 **kwargs)
 
-  def pre_any_node(self):
+  def handle_identity_affine_expr(self):
     node = self.cur_node
-    if ((isinstance(node, ast.AST) and self.affine_annotation[node] !=
-         ir.AffineExpresionCollector.ExpressionKind.non_affine) and
-        (not isinstance(self.parent, ast.AST) or
-         self.affine_annotation[self.parent] ==
-         ir.AffineExpresionCollector.ExpressionKind.non_affine)):
-      aff = ir.ast_to_aff(node, self.ctx, self.domain_space_names,
-                          self.param_space_names)
-      reuse_space_map = aff.eq_map(aff).get_basic_maps()[0]
-      reuse_space_set = self.default_reuse_space_set.apply(reuse_space_map)
-      self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
-      return True
+    aff = ir.ast_to_aff(node, self.ctx, self.domain_space_names,
+                        self.param_space_names)
+    reuse_space_map = aff.eq_map(aff).get_basic_maps()[0]
+    reuse_space_set = self.default_reuse_space_set.apply(reuse_space_map)
+    self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
 
-  def post_any_node(self):
-    pass
-
-  class PatchedDict(defaultdict):
-
-    def get(self, key, default=None):
-      if default is not None:
-        return super().get(key, default)
-      else:
-        return self[key]
-
-  def setup(self):
-    astor.TreeWalk.setup(self)
-    self.pre_handlers = ReuseSpaceCollector.PatchedDict(
-        lambda: self.pre_any_node, self.pre_handlers)
-    self.post_handlers = ReuseSpaceCollector.PatchedDict(
-        lambda: self.post_any_node, self.post_handlers)
-
-  def pre_Subscript(self):
-    if self.cur_node in self.reads:
-      read = self.cur_node
-      read_map = ir.read_ast_to_map(read, self.ctx, self.domain_space_names,
-                                    self.param_space_names,
-                                    self.affine_annotation)
-      if read.value.id not in self.lhs_reuse_space_map:
-        self.lhs_reuse_space_map[read.value.id] = basic_set_zero(
-            read_map.range().get_space())
-      array_ref_reuse_space_set = self.lhs_reuse_space_map[read.value.id]
-      reuse_space_set = array_ref_reuse_space_set.apply(read_map.reverse())
-      self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
-      return True
+  def handle_subscript_affine_expr(self):
+    read = self.cur_node
+    read_map = ir.read_ast_to_map(read, self.ctx, self.domain_space_names,
+                                  self.param_space_names,
+                                  self.affine_annotation)
+    if read.value.id not in self.lhs_reuse_space_map:
+      self.lhs_reuse_space_map[read.value.id] = basic_set_zero(
+          read_map.range().get_space())
+    array_ref_reuse_space_set = self.lhs_reuse_space_map[read.value.id]
+    reuse_space_set = array_ref_reuse_space_set.apply(read_map.reverse())
+    self.reuse_space_set = self.reuse_space_set.intersect(reuse_space_set)
 
 
 def compute_reuse_space_for_statement(
@@ -365,6 +355,10 @@ def sample_non_zero_reuse_vector_for_statement_with_correct_dependence(
   test_vec = test_vec_bs_list.get_at(0)
   if not test_vec.is_singleton():
     raise ValueError("Invalid schedule")
+  # Set params to 1 -- this assumes that all parameters are positive
+  for i in range(test_vec.n_param()):
+    test_vec = test_vec.fix_val(islpy.dim_type.param, i,
+                                islpy.Val.one(test_vec.get_ctx()))
   test_point = test_vec.sample_point()
   for i in range(test_point.get_space().dim(islpy.dim_type.set)):
     coord_val = test_point.get_coordinate_val(islpy.dim_type.set, i).to_python()
@@ -378,8 +372,8 @@ def sample_non_zero_reuse_vector_for_statement_with_correct_dependence(
 
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
-  N
-  A[i] += B[j]     # { [j, i] : 0 <= i < N & 0 <= j < i} ;
+  N M
+  A[i] += B[j]     # { [i, j] : 0 <= i < N & 0 <= j < i} ;
   B[i] = f(A[i])   # { [i] : 0 <= i < N };
   """)
   _, reuse_space_map = compute_reuse_space(prog)

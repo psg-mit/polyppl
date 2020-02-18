@@ -10,7 +10,7 @@ class TestIR(PolyPPLTestCaseBase):
 
   def test_ir_parse_correct(self):
     prog = """N M
-    A[i] += B[j] # {[i, j] : 0 <= i < N & 0 <= j < i};
+    A[i] += B[j] # {[i, j] : 0 <= i < N & 0 <= j < i} & a[i] == b[j];
     X[i, (2*j+i//2)//2] = f(g(i), j) # { [j, i]: 0 <= i < N & 0 <= j < N };
     """
     prog1 = Program.read_from_string(prog, ctx=self.isl_ctx)

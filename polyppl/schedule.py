@@ -3,6 +3,7 @@
 from typing import List, Iterator, Dict, Tuple, Optional
 
 import copy
+import itertools
 
 import ast
 
@@ -72,9 +73,14 @@ def collect_reads(prog: ir.Program) -> islpy.UnionMap:
                                     out=[],
                                     params=prog.param_space_names))
   for _, stmt_id_name, stmt in prog.iter_named_statements():
+    rhs_exprs = list(
+        itertools.chain.from_iterable(
+            [c.left, c.right]
+            for c in stmt.non_affine_constraints)) + [stmt.rhs.body]
+    expr = ast.Expression(body=ast.Tuple(elts=rhs_exprs))
     affine_expr_collector = ir.AffineExpresionCollector(stmt.domain_space_names,
-                                                        stmt.rhs)
-    read_asts = ASTCollectRead(stmt.rhs, declared_lhs_symbols).reads
+                                                        expr)
+    read_asts = ASTCollectRead(expr, declared_lhs_symbols).reads
     for read_ast in read_asts:
       read_map = ir.read_ast_to_map(read_ast, prog.ctx, stmt.domain_space_names,
                                     stmt.param_space_names,
@@ -99,8 +105,8 @@ def inject_reduction_barrier_statements(
     prog: ir.Program) -> Tuple[ir.Program, BarrierMap]:
   """Injects reduction barriers into the program.
 
-  Reduction barrier is effectively a dummy statement that prevents each reduction's
-  left hand side being interleaved with some other statement.
+  Reduction barrier is effectively a dummy statement that prevents each
+  reduction's left hand side being interleaved with some other statement.
   The injected statements' stmt_id can be accesd through the BarrierMap, which
   holds a map from old_reduction_id -> injected_reduction_id.
   """

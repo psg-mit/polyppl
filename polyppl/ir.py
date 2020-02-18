@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import NewType, List, Tuple, Optional, Dict, Sequence, Union
+from typing import NewType, List, Tuple, Optional, Dict, Sequence, Union, Set, Callable
 from typing import Iterator
 
 from dataclasses import dataclass
@@ -106,12 +106,22 @@ class NameReplacer(astor.TreeWalk):
   """Replaces global names in a python expression. """
 
   def __init__(self,
-               replace_map: Dict[VarID, ast.Expression],
+               replace_map: Union[Callable[VarID, ast.Expression],
+                                  Dict[VarID, ast.Expression]],
                node: ast.Expression,
                scope_info=None,
                *args,
                **kwargs):
-    self.replace_map = replace_map
+    if isinstance(replace_map, dict):
+
+      def replace(x):
+        if x in replace_map:
+          return replace_map[x]
+
+      self.replace_map_fn = replace
+    else:
+      self.replace_map_fn = replace_map
+
     if scope_info is None:
       scope_info = ast_scope.annotate(node)
     self.scope_info = scope_info
@@ -120,13 +130,16 @@ class NameReplacer(astor.TreeWalk):
   def post_Name(self):
     node = self.cur_node
     if isinstance(self.scope_info[node], ast_scope.scope.GlobalScope):
-      if node.id in self.replace_map:
-        new_node = self.replace_map[node.id]
-        self.replace(new_node)
+      replace_with = self.replace_map_fn(node.id)
+      if replace_with is not None:
+        self.replace(replace_with)
 
 
-def ast_replace_free_vars(node: ast.Expression,
-                          replacement_map: Dict[VarID, ast.Expression]):
+def ast_replace_free_vars(
+    node: ast.Expression, replacement_map: Union[Callable[VarID,
+                                                          ast.Expression],
+                                                 Dict[VarID, ast.Expression]]
+) -> ast.Expression:
   """Replaces global free variables in a python ast expression.
 
   Args:
@@ -208,15 +221,17 @@ class AffineExpresionCollector(astor.TreeWalk):
 
 
 def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
+  """Converts islpy.Aff into python AST."""
   aff = align_with_ids(aff, domain_space_names)
   coeffs = aff.get_coefficients_by_name(islpy.dim_type.in_)
-  terms = []
+  terms, signs = [], []
   for var, coeff in coeffs.items():
     if var == 1:
       coeff = coeff.floor().to_python()
       if coeff == 0:
         continue
-      term = ast.Num(n=coeff)
+      term = ast.Num(n=abs(coeff))
+      sign = coeff > 0
     else:
       numerator = coeff.get_num_si()
       if numerator == 1:
@@ -224,9 +239,10 @@ def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
       elif numerator == 0:
         continue
       else:
-        term = ast.BinOp(left=ast.Num(n=numerator),
+        term = ast.BinOp(left=ast.Num(n=abs(numerator)),
                          op=ast.Mult(),
                          right=ast.Name(id=var, ctx=ast.Load()))
+      sign = numerator > 0
       try:
         denom = coeff.get_den_val().to_python()
         if denom != 1:
@@ -235,18 +251,25 @@ def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
         raise ValueError(
             "Failed to cast multiaff due to denomerator not a python value")
     terms.append(term)
+    signs.append(sign)
+
   if len(terms) > 0:
-    aff_ast = reduce(
-        lambda left, right: ast.BinOp(left=left, op=ast.Add(), right=right),
-        terms[1:], terms[0])
+    aff_ast = terms[0]
+    for term, sign in zip(terms[1:], signs[1:]):
+      if sign > 0:
+        op = ast.Add()
+      else:
+        op = ast.Sub()
+      aff_ast = ast.BinOp(left=aff_ast, op=op, right=term)
   else:
     aff_ast = ast.Num(n=0)
+
   return aff_ast
 
 
 def multi_aff_to_ast(multiaff: islpy.MultiAff,
                      domain_space_names: List[VarID]) -> List[ast.AST]:
-  """Converts islpy.MultiAff into a python ast."""
+  """Converts islpy.MultiAff into list of python ASTs."""
   multiaff = align_with_ids(multiaff, domain_space_names)
   aff_asts = []
   for i in range(multiaff.dim(islpy.dim_type.out)):
@@ -259,7 +282,8 @@ def multi_aff_to_ast(multiaff: islpy.MultiAff,
 def ast_to_aff(ast: ast.AST, ctx: islpy.Context,
                domain_space_names: List[VarID],
                param_space_names: List[VarID]) -> islpy.Aff:
-  ast_str = astor.to_source(ast)
+  # TODO(camyang) replace with something more robust
+  ast_str = astor.to_source(ast).replace("//", "/")
   aff_str = "[{}] -> {{ [{}] -> [{}] }}".format(",".join(param_space_names),
                                                 ",".join(domain_space_names),
                                                 ast_str)
@@ -304,8 +328,8 @@ def read_ast_to_map(
                                     out=[],
                                     params=param_space_names))
   for target in targets:
-    if affine_annotation[
-        target] == AffineExpresionCollector.ExpressionKind.non_affine:
+    if (affine_annotation[target] ==
+        AffineExpresionCollector.ExpressionKind.non_affine):
       bm_new_dim = islpy.BasicMap.universe(
           islpy.Space.create_from_names(ctx,
                                         in_=domain_space_names,
@@ -319,6 +343,64 @@ def read_ast_to_map(
   return ret_bm
 
 
+class AffineExprWalker(astor.TreeWalk):
+
+  def __init__(self,
+               ctx: islpy.Context,
+               domain_space_names: List[VarID],
+               param_space_names: List[VarID],
+               affine_annotation: AffineExpresionCollector.AnnotationMap,
+               reads: Set[ast.AST],
+               node: Optional[ast.Expression] = None,
+               *args,
+               **kwargs):
+    self.ctx = ctx
+    self.domain_space_names = domain_space_names
+    self.param_space_names = param_space_names
+    self.reads = reads
+    self.affine_annotation = affine_annotation
+    astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
+
+  def pre_any_node(self):
+    node = self.cur_node
+    if ((isinstance(node, ast.AST) and self.affine_annotation[node] !=
+         AffineExpresionCollector.ExpressionKind.non_affine) and
+        (not isinstance(self.parent, ast.AST) or
+         self.affine_annotation[self.parent] ==
+         AffineExpresionCollector.ExpressionKind.non_affine)):
+      self.handle_identity_affine_expr()
+      return True
+
+  def post_any_node(self):
+    pass
+
+  class PatchedDict(defaultdict):
+
+    def get(self, key, default=None):
+      if default is not None:
+        return super().get(key, default)
+      else:
+        return self[key]
+
+  def setup(self):
+    astor.TreeWalk.setup(self)
+    self.pre_handlers = AffineExprWalker.PatchedDict(lambda: self.pre_any_node,
+                                                     self.pre_handlers)
+    self.post_handlers = AffineExprWalker.PatchedDict(
+        lambda: self.post_any_node, self.post_handlers)
+
+  def pre_Subscript(self):
+    if self.cur_node in self.reads:
+      self.handle_subscript_affine_expr()
+      return True
+
+  def handle_identity_affine_expr(self):
+    pass
+
+  def handle_subscript_affine_expr(self):
+    pass
+
+
 ################################################################################
 #    BEGIN Statement
 ################################################################################
@@ -326,11 +408,21 @@ def read_ast_to_map(
 
 class Statement(object):
 
+  NonAffineConstraintLeftOrRight = enum.Enum("NonAffineConstraintLeftOrRight",
+                                             "left right")
+
   class NonAffineConstraint(object):
 
-    def __init__(self, left, right):
+    def __init__(self, left: ast.AST, right: ast.AST):
       self.left = left
       self.right = right
+
+    def get(self,
+            left_or_right: Statement.NonAffineConstraintLeftOrRight) -> ast.AST:
+      if left_or_right == Statement.NonAffineConstraintLeftOrRight.left:
+        return self.left
+      else:
+        return self.right
 
     def __eq__(self, other):
       if isinstance(other, Statement.NonAffineConstraint):
@@ -348,7 +440,10 @@ class Statement(object):
                rhs: ast.AST,
                lhs_proj: MultiAff,
                op: Optional[ReductionOpId] = None,
-               non_affine_constraints: List[NonAffineConstraint] = []):
+               non_affine_constraints: List[NonAffineConstraint] = [],
+               histograms: Set[Tuple[
+                   int,
+                   Statement.NonAffineConstraintLeftOrRight]] = OrderedSet()):
     self.domain = domain
     self.param_space_names = param_space_names
     self.domain_space_names = domain_space_names
@@ -356,7 +451,8 @@ class Statement(object):
     self.lhs_proj = lhs_proj
     self.op = op
     self.rhs = rhs
-    self.non_affine_constraints = non_affine_constraints
+    self.non_affine_constraints = list(non_affine_constraints)
+    self.histograms = OrderedSet(histograms)
 
   @property
   def is_reduction(self):
@@ -380,6 +476,10 @@ class Statement(object):
   @property
   def belongs_to_program(self) -> bool:
     return self._prog is not None
+
+  def set_histogramed(self, non_affine_idx: int,
+                      left_or_right: Statement.NonAffineConstraintLeftOrRight):
+    self.histograms.add((non_affine_idx, left_or_right))
 
   RE_TUPLE = r"\[[^\]]+\]"
   ARROW = r"\s*->\s*"
@@ -478,12 +578,15 @@ class Program(object):
     def get_text_from_node(ast_node) -> str:
       return src[ast_node.meta.start_pos:ast_node.meta.end_pos]
 
-    def safe_find_data(node, data: str):
+    def safe_find_data(node, data: str, raise_if_not_found=True):
       try:
         return next(node.find_data(data))
       except StopIteration:
-        raise Program.ProgramParseError("Cannot find {} in {}".format(
-            data, node))
+        if raise_if_not_found:
+          raise Program.ProgramParseError("Cannot find {} in {}".format(
+              data, node))
+        else:
+          return None
 
     try:
       ir_ast = Program.parser.parse(src)
@@ -536,6 +639,38 @@ class Program(object):
           raise Program.ProgramParseError(
               "lhs_proj is not bijective while statement is not a reduction")
 
+      # Parse rhs expression into python ast
+      non_affine_constraints = safe_find_data(stmt_ast,
+                                              "non_affine_guards",
+                                              raise_if_not_found=False)
+      if non_affine_constraints is None:
+        non_affine_constraints = []
+      else:
+        non_affine_constraints = get_text_from_node(non_affine_constraints)
+        # Remove leading whitespaces
+        non_affine_constraints = non_affine_constraints.lstrip()
+        non_affine_constraints = ast.parse(non_affine_constraints, mode="eval")
+        if isinstance(non_affine_constraints.body, ast.Compare):
+          compares = [non_affine_constraints.body]
+        elif (isinstance(non_affine_constraints.body, ast.BoolOp) and
+              isinstance(non_affine_constraints.body.op, ast.And)):
+          compares = non_affine_constraints.body.values
+        else:
+          raise Program.ProgramParseError(
+              "non_affine_constraints is not a valid python boolean conjunction"
+          )
+        non_affine_constraints = []
+        for cmp_exp in compares:
+          if isinstance(cmp_exp, ast.Compare) and len(
+              cmp_exp.comparators) == 1 and isinstance(cmp_exp.ops[0], ast.Eq):
+            left = cmp_exp.left
+            right = cmp_exp.comparators[0]
+            non_affine_constraints.append(
+                Statement.NonAffineConstraint(left, right))
+          else:
+            raise Program.ProgramParseError(
+                "non_affine_constraints is not a conjunction of equalities")
+
       prog.add_statement(
           Statement(domain,
                     param_space_names,
@@ -543,7 +678,8 @@ class Program(object):
                     lhs_array_name,
                     rhs,
                     lhs_proj,
-                    op=op))
+                    op=op,
+                    non_affine_constraints=non_affine_constraints))
     return prog
 
   def stmt_name(self, stmt_id: StatementID):
