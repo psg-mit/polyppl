@@ -12,7 +12,7 @@ class TestIR(PolyPPLTestCaseBase):
 
   def _test_single(self, prog: str, reuse: str):
     prog = ir.Program.read_from_string(prog, ctx=self.isl_ctx)
-    rs_computed = st.compute_reuse_space(prog)[0]["X"]
+    rs_computed = st.compute_share_space(prog)[0]["X"]
     rs = islpy.BasicSet.read_from_str(self.isl_ctx, reuse)
     self.assertEqual(rs_computed, rs)
 

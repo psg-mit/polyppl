@@ -82,9 +82,10 @@ def collect_reads(prog: ir.Program) -> islpy.UnionMap:
                                                         expr)
     read_asts = ASTCollectRead(expr, declared_lhs_symbols).reads
     for read_ast in read_asts:
-      read_map = ir.read_ast_to_map(read_ast, prog.ctx, stmt.domain_space_names,
-                                    stmt.param_space_names,
-                                    affine_expr_collector.annotation)
+      read_map = ir.read_ast_to_map(
+          read_ast, prog.ctx, stmt.domain_space_names, stmt.param_space_names,
+          affine_expr_collector.annotation).align_params(
+              stmt.domain.get_space().params())
       read_map = read_map.intersect_domain(stmt.domain).set_tuple_name(
           islpy.dim_type.in_,
           stmt_id_name).set_tuple_name(islpy.dim_type.out, read_ast.value.id)

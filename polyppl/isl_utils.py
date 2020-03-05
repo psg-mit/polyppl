@@ -1,7 +1,8 @@
 """Utilities."""
 
-from typing import Union, List, TYPE_CHECKING
+from typing import Union, List, Iterator, TYPE_CHECKING
 
+import numpy as np
 import islpy
 
 if TYPE_CHECKING:
@@ -34,6 +35,21 @@ def align_with_ids(obj: Union[islpy.BasicSet, islpy.Set, islpy.Aff,
     raise TypeError("Invalid input")
 
 
+def union_map_get_maps(um: islpy.UnionMap) -> Iterator[islpy.BasicMap]:
+  ml = um.get_map_list()
+  for i in range(ml.n_map()):
+    yield ml.get_at(i)
+
+
+def isl_mat_to_numpy(mat: islpy.Mat) -> np.array:
+  ncols, nrows = mat.cols(), mat.rows()
+  ret = np.empty((nrows, ncols), dtype=np.int32)
+  for i in range(nrows):
+    for j in range(ncols):
+      ret[i, j] = mat.get_element_val(i, j).to_python()
+  return ret
+
+
 def set_all_tuple_names(umap, dim, name):
   ret = islpy.UnionMap.empty(umap.get_space())
 
@@ -59,6 +75,10 @@ def basic_set_zero(space: islpy.Space):
   return bs
 
 
+def basic_set_remove_zero(bs: islpy.BasicSet) -> islpy.Set:
+  return bs.subtract(basic_set_zero(bs.get_space()))
+
+
 def point_to_multi_val(point: islpy.Point) -> islpy.MultiVal:
   ndim = point.get_space().dim(islpy.dim_type.set)
   vallist = islpy.ValList.alloc(point.get_ctx(), ndim)
@@ -66,6 +86,23 @@ def point_to_multi_val(point: islpy.Point) -> islpy.MultiVal:
     val = point.get_coordinate_val(islpy.dim_type.set, i)
     vallist = vallist.add(val)
   return islpy.MultiVal.from_val_list(point.get_space(), vallist)
+
+
+def compute_null_space(bf: islpy.MultiAff) -> islpy.BasicSet:
+  """Computes null space of function.
+
+  Given affine function f(a) = b, compute {x | forall u, f(u) = f(u + x) }
+  """
+  bm = islpy.BasicMap.from_multi_aff(bf)
+  null_map = bm.apply_range(bm.reverse())
+  null_set = basic_set_zero(null_map.get_space().domain()).apply(null_map)
+  return null_set
+
+
+def compute_proj_kernel(proj: islpy.MultiAff) -> islpy.BasicSet:
+  bm = islpy.BasicMap.from_multi_aff(proj)
+  proj_kernel = basic_set_zero(bm.get_space().range()).apply(bm.reverse())
+  return proj_kernel
 
 
 def compute_lineality_space(bs: islpy.BasicSet) -> islpy.BasicSet:
@@ -133,7 +170,7 @@ def compute_effective_linear_space(bs: islpy.BasicSet) -> islpy.BasicSet:
 def compute_saturated_constraints(bs: islpy.BasicSet) -> List[islpy.Constraint]:
   """Computes the saturated constraints.
 
-  A constraint c is saturated if c & P == P.
+  A constraint c is saturated if (c^-1) & P == P.
   """
   ret = []
   for c in bs.get_constraints():
@@ -145,13 +182,6 @@ def compute_saturated_constraints(bs: islpy.BasicSet) -> List[islpy.Constraint]:
       if bs_test == bs:
         ret.append(c)
   return ret
-
-
-def compute_proj_kernel(proj: islpy.MultiVal) -> islpy.BasicSet:
-  proj_map = islpy.BasicMap.from_multi_aff(proj)
-  proj_kernel = basic_set_zero(proj_map.get_space().range()).apply(
-      proj_map.reverse())
-  return proj_kernel
 
 
 def compute_boundary_constraint(bs: islpy.BasicSet,

@@ -51,9 +51,13 @@ def tmp_var_allocator(ctx: Optional[islpy.Context] = None,
                       basename: Optional[str] = None):
   # TODO(camyang) better design here
   count = 0
+  if basename is None:
+    basename = ""
+  else:
+    basename += "_"
 
   def tmp_var_allocator(num: int = 1) -> Union[List["VarID"], List[islpy.Id]]:
-    ret = [VarID("_i{}".format(count + i)) for i in range(num)]
+    ret = [VarID("_{}i{}".format(basename, count + i)) for i in range(num)]
     if ctx is not None:
       ret = [islpy.Id.alloc(ctx, v, None) for v in ret]
     nonlocal count
@@ -223,7 +227,9 @@ class AffineExpresionCollector(astor.TreeWalk):
 def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
   """Converts islpy.Aff into python AST."""
   aff = align_with_ids(aff, domain_space_names)
+  # wierd API stuff, see https://github.com/inducer/islpy/issues/24
   coeffs = aff.get_coefficients_by_name(islpy.dim_type.in_)
+  coeffs.update(aff.get_coefficients_by_name(islpy.dim_type.param))
   terms, signs = [], []
   for var, coeff in coeffs.items():
     if var == 1:
@@ -433,7 +439,7 @@ class Statement(object):
   ReductionOpId = NewType("ReductionOpId", str)
 
   def __init__(self,
-               domain: BasicSet,
+               domain: Union[BasicSet, Set],
                param_space_names: List[VarID],
                domain_space_names: List[VarID],
                lhs_array_name: ArrayID,
@@ -448,7 +454,7 @@ class Statement(object):
     self.param_space_names = param_space_names
     self.domain_space_names = domain_space_names
     self.lhs_array_name = lhs_array_name
-    self.lhs_proj = lhs_proj
+    self.lhs_proj = lhs_proj.align_params(self.domain.get_space().params())
     self.op = op
     self.rhs = rhs
     self.non_affine_constraints = list(non_affine_constraints)
