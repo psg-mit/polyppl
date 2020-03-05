@@ -412,8 +412,8 @@ if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
   N
   # A[i] += B[j] # { [i, j] : 0 <= i < N & 0 <= j & j < x2 & i < N - x1};
-  A[i] += B[N-j] # { [i, j] : 0 <= i < N & 0 <= j < i};
-  B[i] = A[i] # { [i] : 0 <= i < N};
+  A[i] += B[j+1] # { [i, j] : 0 <= i < N & 0 <= j < i};
+  B[i+1] = A[i] # { [i] : 0 <= i < N};
   # A1[i] += B1[j] # { [i, j] : 0 <= i < N & 0 <= j < i};
   # B[i] = f(B[i]) # { [i] : 0 <= i < N };
   """)

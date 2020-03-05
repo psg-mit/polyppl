@@ -108,6 +108,13 @@ class TestIR(PolyPPLTestCaseBase):
         """,
         "{ [i] : }"
       ),
+      (
+        """N
+        A[i] += X[j+1] # { [i, j] : 0 <= i < N & 0 <= j < i};
+        X[i+1] = A[i] # { [i]:  0 <= i < N };
+        """,
+        "{ [i, j]: i = 0 }"
+      ),
     ]
     # yapf: enable
 

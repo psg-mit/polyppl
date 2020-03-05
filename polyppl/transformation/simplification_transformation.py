@@ -257,6 +257,7 @@ class ShareSpaceCollector(ir.AffineExprWalker):
                         self.param_space_names)
     share_space_map = aff.eq_map(aff).get_basic_maps()[0]
     share_space_set = self.default_share_space_set.apply(share_space_map)
+    share_space_set = isl_utils.compute_lineality_space(share_space_set)
     self.share_space_set = self.share_space_set.intersect(share_space_set)
 
   def handle_subscript_affine_expr(self):
@@ -268,7 +269,9 @@ class ShareSpaceCollector(ir.AffineExprWalker):
       self.lhs_share_space_map[read.value.id] = basic_set_zero(
           read_map.range().get_space())
     array_ref_share_space_set = self.lhs_share_space_map[read.value.id]
+
     share_space_set = array_ref_share_space_set.apply(read_map.reverse())
+    share_space_set = isl_utils.compute_lineality_space(share_space_set)
     self.share_space_set = self.share_space_set.intersect(share_space_set)
 
 
@@ -434,8 +437,8 @@ def sample_non_zero_reuse_vector_for_statement_with_correct_dependence(
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
   N M
-  A[i] += B[j]     # { [i, j] : 0 <= i < N & 0 <= j < i} ;
-  B[i] = f(A[i])   # { [i] : 0 <= i < N };
+  A[i] += B[j+1]     # { [i, j] : 0 <= i < N & 0 <= j < i} ;
+  B[i+1] = f(A[i])   # { [i] : 0 <= i < N };
   """)
   _, share_space_map = compute_share_space(prog)
   stmt_id = 0
