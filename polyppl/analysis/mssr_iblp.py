@@ -15,6 +15,8 @@ import polyppl.isl_utils as isl_utils
 import polyppl.transformation.simplification_transformation as st
 import polyppl.schedule as sched
 
+# pylint: disable=E1136  # pylint/issues/3139
+
 ISL_SET_MAT_DIM_ORDER = [
     islpy.dim_type.set, islpy.dim_type.div, islpy.dim_type.param,
     islpy.dim_type.cst
@@ -47,6 +49,11 @@ Term = Tuple[int]
 
 def qpoly_to_sum_of_terms(qpoly: islpy.QPolynomial,
                           n_initial_params: int) -> List[Term]:
+  """Convert a QPolynomial to a list of Terms.
+
+  A Term is a tuple of integers, representing the exponenet of each symbol in
+  the polynomial term.
+  """
   ret = []
   for term in qpoly.get_terms():
     ret_term = []
@@ -57,8 +64,18 @@ def qpoly_to_sum_of_terms(qpoly: islpy.QPolynomial,
 
 
 def term_comparator_from_symbol_order(symbol_order: List[int]):
+  """Create a comparator for a term, given the symbol ordering of the symbols in
+  the term.
 
-  def term_comparator(term1: Term, term2: Term) -> bool:
+  Args:
+    - symbol_order: a list of integers, representing the sorted indices of the
+    term's symbols
+
+  Returns:
+    A comparator function between terms.
+  """
+
+  def term_comparator(term1: Term, term2: Term) -> int:
     term1 = tuple(term1[i] for i in symbol_order)
     term2 = tuple(term2[i] for i in symbol_order)
     if term1 > term2:

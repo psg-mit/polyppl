@@ -40,4 +40,4 @@ m.optimize()
 for v in m.getVars():
   print('%s %g' % (v.varName, v.x))
 
-print('Obj: %g' % obj.getValue())
+# print('Obj: %g' % obj.getValue())
