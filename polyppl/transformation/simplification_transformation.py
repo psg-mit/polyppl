@@ -437,8 +437,8 @@ def sample_non_zero_reuse_vector_for_statement_with_correct_dependence(
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
   N M
-  A[i] += B[j+1]     # { [i, j] : 0 <= i < N & 0 <= j < i} ;
-  B[i+1] = f(A[i])   # { [i] : 0 <= i < N };
+  A[i] += B[j]     # { [i, j] : 0 <= i < N & 0 <= j < i} ;
+  B[i] = f(A[i])   # { [i] : 0 <= i < N };
   """)
   _, share_space_map = compute_share_space(prog)
   stmt_id = 0

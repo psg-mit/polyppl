@@ -489,7 +489,7 @@ class Statement(object):
 
   RE_TUPLE = r"\[[^\]]+\]"
   ARROW = r"\s*->\s*"
-  RE_DOMAIN = fr"{RE_TUPLE}{ARROW}(?P<polyhedron>{{[^}}]+}})"
+  RE_DOMAIN = fr"({RE_TUPLE}{ARROW})?(?P<polyhedron>{{[^}}]+}})"
 
   def __repr__(self):
     aff_list_ast = multi_aff_to_ast(self.lhs_proj, self.domain_space_names)
