@@ -5,6 +5,8 @@ import itertools
 import operator
 import functools
 
+import ast
+
 import numpy as np
 import islpy
 import gurobipy as gp
@@ -41,6 +43,25 @@ def basic_set_is_bounded(bs: islpy.BasicSet) -> bool:
 
   TODO(camyang) needs some rethinking the soundness of this operation.
   """
+  # for i in range(bs.n_dim()):
+  #   bs = bs.add_dims(islpy.dim_type.param,
+  #                    1).set_dim_name(islpy.dim_type.param, bs.n_param(),
+  #                                    "_BOUND{}".format(i))
+  #   x = islpy.Aff.var_on_domain(bs.get_space(), islpy.dim_type.set, i)
+  #   b = islpy.Aff.var_on_domain(bs.get_space(), islpy.dim_type.param,
+  #                               bs.n_param() - 1)
+  #   bs = bs.add_constraints([
+  #       islpy.Constraint.inequality_from_aff(x.add(b)),
+  #       islpy.Constraint.inequality_from_aff(b.sub(x))
+  #   ])
+  # for i in range(bs.n_dim()):
+  #   for s, aff in bs.dim_max(i).get_pieces():
+  #     if s.min_val(aff).is_neginfty():
+  #       return False
+  # for i in range(bs.n_dim()):
+  #   for s, aff in bs.dim_min(i).get_pieces():
+  #     if s.max_val(aff).is_infty():
+  #       return False
   return True
 
 
@@ -100,7 +121,6 @@ def bilp_schedule_build_gurobi_model(prog: ir.Program,
       raise ValueError("Affine formulation requires non-negative K")
 
   deps = sched.compute_dependencies(prog).reverse()
-  print(deps)
   mdl = gp.Model("miqp")
   mdl.setParam("NonConvex", 2)
 
@@ -246,20 +266,27 @@ def bilp_schedule_build_gurobi_model(prog: ir.Program,
   symb_domain = symb_domain.coalesce().move_dims(islpy.dim_type.set, 0,
                                                  islpy.dim_type.param, 0,
                                                  symb_domain.n_param())
-  print(symb_domain)
-  assert symb_domain.n_basic_set() <= 1
-  if symb_domain.n_basic_set() == 1:
-    symb_domain = symb_domain.get_basic_sets()[0]
+  in_symb_domain_bs_indicators = []
+  for symb_domain_bs in symb_domain.get_basic_sets():
     eq_mat = isl_utils.isl_mat_to_numpy(
-        symb_domain.equalities_matrix(*ISL_SET_MAT_DIM_ORDER))
+        symb_domain_bs.equalities_matrix(*ISL_SET_MAT_DIM_ORDER))
     ineq_mat = isl_utils.isl_mat_to_numpy(
-        symb_domain.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
-    symb_vars = gp.MVar([
+        symb_domain_bs.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
+    symb_vars = np.array([
         symb_name_to_var[n]
         for n in symb_domain.get_var_names(islpy.dim_type.set)
-    ])
-    mdl.addConstr(eq_mat[:, :-1] @ symb_vars + eq_mat[:, -1] == 0)
-    mdl.addConstr(ineq_mat[:, :-1] @ symb_vars + ineq_mat[:, -1] >= 0)
+    ] + [1])
+    in_symb_domain_bs = mdl.addVar(vtype=GRB.BINARY,
+                                   name="in_symb_domain_bs_indicator")
+    in_symb_domain_bs_indicators.append(in_symb_domain_bs)
+    for c in eq_mat.dot(symb_vars):
+      mdl.addConstr((in_symb_domain_bs == 1) >> (c == 0))
+    for c in ineq_mat.dot(symb_vars):
+      mdl.addConstr((in_symb_domain_bs == 1) >> (c >= 0))
+  assert len(in_symb_domain_bs_indicators) > 0
+  in_symb_domain = mdl.addVar(vtype=GRB.BINARY, name="in_symb_domain")
+  mdl.addConstr(in_symb_domain == gp.or_(*in_symb_domain_bs_indicators))
+  mdl.addConstr(in_symb_domain == 1)
 
   # Objective
   if term_comparator is None:
@@ -363,8 +390,12 @@ def concretize_isl_object(isl_obj: Any, n_initial_params: int,
 def concretize_symbolic_program(prog: ir.Program, sym_to_cst: Dict[str, int]):
   n_params = len(prog.param_space_names)
   to_remove = []
+  ast_replacement_map = {
+      symb: ast.Num(n=cst) for symb, cst in sym_to_cst.items()
+  }
   for stmt_id, _, stmt in prog.iter_named_statements():
     stmt.domain = concretize_isl_object(stmt.domain, n_params, sym_to_cst)
+    stmt.rhs = ir.ast_replace_free_vars(stmt.rhs, ast_replacement_map)
     stmt.lhs_proj = stmt.lhs_proj.drop_dims(
         islpy.dim_type.param, n_params,
         stmt.lhs_proj.dim(islpy.dim_type.param) - n_params)
@@ -476,7 +507,6 @@ def apply_symbolic_st(prog: ir.Program):
       if stmt.is_reduction
   ]
   _, share_space_map = st.compute_share_space(prog)
-  print(share_space_map)
   st_count = 0
   while len(unprocessed_reductions) > 0:
     reduction_id = unprocessed_reductions.pop()
@@ -484,7 +514,7 @@ def apply_symbolic_st(prog: ir.Program):
         prog, reduction_id, share_space_map)
     if reuse_set.is_empty():
       continue
-    reuse_set = reuse_set.union(isl_utils.basic_set_zero(reuse_set.get_space()))
+    # reuse_set = reuse_set.union(isl_utils.basic_set_zero(reuse_set.get_space()))
     r_e, r_e_param_symb_domain = sample_vector_from_reuse_set_symbolic(
         reuse_set, "L{}".format(st_count))
     old_num_stmts = len(prog.statements)
@@ -514,8 +544,8 @@ def apply_symbolic_st(prog: ir.Program):
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
   N
-  A[i] += B[N-j] # { [j, i] : 0 <= i < N & 0 <= j < i };
-  B[i] = A[i] # { [i] : 0 <= i < N };
+  A[i] += 1 # { [i, j] : 0 <= i < N & 0 <= j < i };
+  # B[i] = A[i] # { [i] : 0 <= i < N };
   # B[i] = A[i] # { [i] : 0 <= i < 2 };
   # A1[i] += B1[j] # { [i, j] : 0 <= i < N & 0 <= j < i};
   # B[i] = f(B[i]) # { [i] : 0 <= i < N };
