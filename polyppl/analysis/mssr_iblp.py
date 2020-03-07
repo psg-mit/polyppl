@@ -116,6 +116,7 @@ def bilp_schedule_build_gurobi_model(prog: ir.Program,
                                                                bool] = None,
                                      K: int = 10000,
                                      use_affine_formulation=True) -> gp.Model:
+  #TODO(camyang) implement non affine formulation
   if use_affine_formulation:
     if K < 0:
       raise ValueError("Affine formulation requires non-negative K")
