@@ -229,7 +229,8 @@ def replace_lhs_by_histogramed_access(
     for histogram_access_ast in histogram_access_asts:
       node = copy.deepcopy(ast.Expression(body=histogram_access_ast))
       affine_annotation = ir.AffineExpresionCollector(
-          decl_stmt.domain_space_names, node).annotation
+          decl_stmt.param_space_names, decl_stmt.domain_space_names,
+          node).annotation
       AffineExprReplacer(decl_stmt,
                          replacement_asts,
                          prog.ctx,
@@ -299,7 +300,8 @@ def code_gen_user_node(
   ]
 
   def replace_histogram_expr(node):
-    affine_annotation = ir.AffineExpresionCollector(stmt.domain_space_names,
+    affine_annotation = ir.AffineExpresionCollector(stmt.param_space_names,
+                                                    stmt.domain_space_names,
                                                     node).annotation
     reads = schedule.ASTCollectRead(node, declared_lhs_symbols).reads
     HistogramArrayRefRewriter(prog.ctx, stmt.domain_space_names,

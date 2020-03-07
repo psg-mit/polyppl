@@ -78,7 +78,8 @@ def collect_reads(prog: ir.Program) -> islpy.UnionMap:
             [c.left, c.right]
             for c in stmt.non_affine_constraints)) + [stmt.rhs.body]
     expr = ast.Expression(body=ast.Tuple(elts=rhs_exprs))
-    affine_expr_collector = ir.AffineExpresionCollector(stmt.domain_space_names,
+    affine_expr_collector = ir.AffineExpresionCollector(stmt.param_space_names,
+                                                        stmt.domain_space_names,
                                                         expr)
     read_asts = ASTCollectRead(expr, declared_lhs_symbols).reads
     for read_ast in read_asts:

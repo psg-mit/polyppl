@@ -52,7 +52,8 @@ def histogram(prog: ir.Program, lhs: ir.VarID, non_affine_idx: int,
   ref_ast = stmt.non_affine_constraints[non_affine_idx].get(
       (LeftOrRight.left
        if left_or_right == LeftOrRight.right else LeftOrRight.right))
-  affine_expr_collector = ir.AffineExpresionCollector(stmt.domain_space_names,
+  affine_expr_collector = ir.AffineExpresionCollector(stmt.param_space_names,
+                                                      stmt.domain_space_names,
                                                       ref_ast)
   AffineExprChecker(stmt,
                     prog.ctx,

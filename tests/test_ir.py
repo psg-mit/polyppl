@@ -9,13 +9,18 @@ from tests.base import PolyPPLTestCaseBase
 class TestIR(PolyPPLTestCaseBase):
 
   def test_ir_parse_correct(self):
-    prog = """N M
+    progs = []
+
+    progs.append("""N M
     A[i] += B[j] # {[i, j] : 0 <= i < N & 0 <= j < i} & a[i] == b[j];
     X[i, (2*j+i//2)//2] = f(g(i), j) # { [j, i]: 0 <= i < N & 0 <= j < N };
-    """
-    prog1 = Program.read_from_string(prog, ctx=self.isl_ctx)
-    prog2 = Program.read_from_string(repr(prog1))
-    self.assertEqual(prog1, prog2)
+    """)
+
+    for i, prog in enumerate(progs):
+      with self.subTest(i=i):
+        prog1 = Program.read_from_string(prog, ctx=self.isl_ctx)
+        prog2 = Program.read_from_string(repr(prog1))
+        self.assertEqual(prog1, prog2)
 
   def test_ir_parse_rejects_incorrect(self):
     progs = []

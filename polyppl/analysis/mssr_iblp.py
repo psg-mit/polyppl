@@ -88,15 +88,21 @@ def term_comparator_from_symbol_order(symbol_order: List[int]):
   return term_comparator
 
 
-def bilp_schedule_build_gurobi_model(
-    prog: ir.Program,
-    schedule_dim: int,
-    model_name="model",
-    term_comparator: Callable[[Term, Term], bool] = None) -> gp.Model:
+def bilp_schedule_build_gurobi_model(prog: ir.Program,
+                                     schedule_dim: int,
+                                     model_name="model",
+                                     term_comparator: Callable[[Term, Term],
+                                                               bool] = None,
+                                     K: int = 10000,
+                                     use_affine_formulation=True) -> gp.Model:
+  if use_affine_formulation:
+    if K < 0:
+      raise ValueError("Affine formulation requires non-negative K")
+
   deps = sched.compute_dependencies(prog).reverse()
   print(deps)
   mdl = gp.Model("miqp")
-  # mdl.setParam("NonConvex", 2)
+  mdl.setParam("NonConvex", 2)
 
   n_params = len(prog.param_space_names)
 
@@ -140,8 +146,6 @@ def bilp_schedule_build_gurobi_model(
                 out_domain.align_params(param_space)).remove_redundancies()
         if dep_bm.is_empty():
           continue
-        import pdb
-        pdb.set_trace()
         theta_in_set, theta_in_param, theta_in_cst = (
             theta_in[:, :stmt_in_dim],
             theta_in[:, stmt_in_dim:stmt_in_dim + n_params], theta_in[:, -1])
@@ -167,11 +171,10 @@ def bilp_schedule_build_gurobi_model(
 
         del dep_eq_mat, dep_ineq_mat
 
-        strongly_sat_p = mdl.addVar(
-            lb=0,
-            ub=schedule_dim - 1,
-            vtype=GRB.INTEGER,
-            name="strongly_sat_p/dep={}".format(which_dep))
+        deltas_raw = add_np_mat_vars(mdl, (schedule_dim,),
+                                     vtype=GRB.INTEGER,
+                                     name="delta_k")
+        deltas = gp.MVar(deltas_raw)
 
         for k in range(schedule_dim):
           theta_in_set_k_mv = gp.MVar(theta_in_set[k])
@@ -190,143 +193,148 @@ def bilp_schedule_build_gurobi_model(
           idx += stmt_out_dim
           mdl.addConstr(0 == dep_mat[:, idx:idx + dep_div_dim].T @ lambda_k_mv)
           idx += dep_div_dim
-          mdl.addConstr((theta_in_param_k_mv - theta_out_param_k_mv) == (
-              dep_mat[:, idx:idx + n_params].T @ lambda_k_mv))
+          deltas_prefix_sum = deltas[:k - 1].sum()
+          if n_params > 0:
+            mdl.addConstr((theta_in_param_k_mv - theta_out_param_k_mv +
+                           K * deltas_prefix_sum) == (
+                               dep_mat[:, idx:idx + n_params].T @ lambda_k_mv))
           idx += n_params
           assert idx + n_symbs + 1 == dep_mat.shape[1]
+          lhs = theta_in_cst[k] - theta_out_cst[k] + K * np.sum(
+              deltas_raw[:k - 1]) - deltas_raw[k]
+          rhs = (dep_mat[:, idx:].dot(sym_vars_and_cst)).dot(lambda_[k])
+          mdl.addConstr(lhs == rhs)
           # add the cst constraint
           # that is:
           #  theta_S - theta_T - delta = lambda .* D .* [symb, 1]^T
           #
-          delta_k = mdl.addVar(vtype=GRB.BINARY,
-                               name="delta/dim={}&dep={}".format(k, which_dep))
-          if k > 0:
-            need_sat = mdl.addVar(vtype=GRB.BINARY,
-                                  name="need_sat/dim={}&dep={}".format(
-                                      k, which_dep))
-            mdl.addConstr((need_sat == 1) >> (k <= strongly_sat_p))
-            mdl.addConstr((need_sat == 0) >> (k >= strongly_sat_p + 1))
-          mdl.addConstr((delta_k == 1) >> (k >= strongly_sat_p))
-          mdl.addConstr((delta_k == 0) >> (k <= strongly_sat_p - 1))
-          lhs = theta_in_cst[k] - theta_out_cst[k] - delta_k
-          import pdb
-          pdb.set_trace()
-          rhs = (dep_mat[:, idx:].dot(sym_vars_and_cst)).dot(lambda_[k])
-          if isinstance(rhs, gp.LinExpr):
-            tmp_var = rhs
-          else:
-            tmp_var = mdl.addVar(vtype=GRB.INTEGER,
-                                 name="indicator_quad_helper")
-            mdl.addConstr(tmp_var == rhs)
-          if k == 0:
-            mdl.addConstr(lhs == tmp_var)
-          else:
-            mdl.addConstr((need_sat == 1) >> (lhs == tmp_var))
-  # # Reuse direction constraints
-  # symb_domain = islpy.Set.empty(
-  #     islpy.Space.create_from_names(prog.ctx,
-  #                                   set=[],
-  #                                   params=symb_name_to_var.keys()))
-  # for _, stmt_name, stmt in prog.iter_named_statements():
-  #   if not stmt.is_reduction:
-  #     continue
-  #   stmt_symb_domain = stmt.domain.project_out(islpy.dim_type.param, 0,
-  #                                              n_params).project_out(
-  #                                                  islpy.dim_type.set, 0,
-  #                                                  stmt.domain.n_dim())
-  #   symb_domain = symb_domain.union(stmt_symb_domain)
-  # symb_domain = symb_domain.coalesce().move_dims(islpy.dim_type.set, 0,
-  #                                                islpy.dim_type.param, 0,
-  #                                                symb_domain.n_param())
-  # assert symb_domain.n_basic_set() <= 1
-  # if symb_domain.n_basic_set() == 1:
-  #   symb_domain = symb_domain.get_basic_sets()[0]
-  #   eq_mat = isl_utils.isl_mat_to_numpy(
-  #       symb_domain.equalities_matrix(*ISL_SET_MAT_DIM_ORDER))
-  #   ineq_mat = isl_utils.isl_mat_to_numpy(
-  #       symb_domain.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
-  #   symb_vars = gp.MVar([
-  #       symb_name_to_var[n]
-  #       for n in symb_domain.get_var_names(islpy.dim_type.set)
-  #   ])
-  #   mdl.addConstr(eq_mat[:, :-1] @ symb_vars + eq_mat[:, -1] == 0)
-  #   mdl.addConstr(ineq_mat[:, :-1] @ symb_vars + ineq_mat[:, -1] >= 0)
+          # if k > 0:
+          #   need_sat = mdl.addVar(vtype=GRB.BINARY,
+          #                         name="need_sat/dim={}&dep={}".format(
+          #                             k, which_dep))
+          #   mdl.addConstr((need_sat == 1) >> (k <= strongly_sat_p))
+          #   mdl.addConstr((need_sat == 0) >> (k >= strongly_sat_p + 1))
+          # mdl.addConstr((delta_k == 1) >> (k >= strongly_sat_p))
+          # mdl.addConstr((delta_k == 0) >> (k <= strongly_sat_p - 1))
+          # lhs = theta_in_cst[k] - theta_out_cst[k] - delta_k
+          # import pdb
+          # pdb.set_trace()
+          # rhs = (dep_mat[:, idx:].dot(sym_vars_and_cst)).dot(lambda_[k])
+          # if isinstance(rhs, gp.LinExpr):
+          #   tmp_var = rhs
+          # else:
+          #   tmp_var = mdl.addVar(vtype=GRB.INTEGER,
+          #                        name="indicator_quad_helper")
+          #   mdl.addConstr(tmp_var == rhs)
+          # if k == 0:
+          #   mdl.addConstr(lhs == tmp_var)
+          # else:
+          #   mdl.addConstr((need_sat == 1) >> (lhs == tmp_var))
+  # Reuse direction constraints
+  symb_domain = islpy.Set.empty(
+      islpy.Space.create_from_names(prog.ctx,
+                                    set=[],
+                                    params=symb_name_to_var.keys()))
+  for _, stmt_name, stmt in prog.iter_named_statements():
+    if not stmt.is_reduction:
+      continue
+    stmt_symb_domain = stmt.domain.project_out(islpy.dim_type.param, 0,
+                                               n_params).project_out(
+                                                   islpy.dim_type.set, 0,
+                                                   stmt.domain.n_dim())
+    symb_domain = symb_domain.union(stmt_symb_domain)
+  symb_domain = symb_domain.coalesce().move_dims(islpy.dim_type.set, 0,
+                                                 islpy.dim_type.param, 0,
+                                                 symb_domain.n_param())
+  print(symb_domain)
+  assert symb_domain.n_basic_set() <= 1
+  if symb_domain.n_basic_set() == 1:
+    symb_domain = symb_domain.get_basic_sets()[0]
+    eq_mat = isl_utils.isl_mat_to_numpy(
+        symb_domain.equalities_matrix(*ISL_SET_MAT_DIM_ORDER))
+    ineq_mat = isl_utils.isl_mat_to_numpy(
+        symb_domain.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
+    symb_vars = gp.MVar([
+        symb_name_to_var[n]
+        for n in symb_domain.get_var_names(islpy.dim_type.set)
+    ])
+    mdl.addConstr(eq_mat[:, :-1] @ symb_vars + eq_mat[:, -1] == 0)
+    mdl.addConstr(ineq_mat[:, :-1] @ symb_vars + ineq_mat[:, -1] >= 0)
 
-  # # Objective
-  # if term_comparator is None:
-  #   term_comparator = term_comparator_from_symbol_order(range(n_params))
-  # term_order_key_func = functools.cmp_to_key(term_comparator)
+  # Objective
+  if term_comparator is None:
+    term_comparator = term_comparator_from_symbol_order(range(n_params))
+  term_order_key_func = functools.cmp_to_key(term_comparator)
 
-  # all_domains = sched.program_get_domain(prog)
-  # print("Card...")
-  # all_domains_card = all_domains.card()
-  # print("done")
-  # ql = all_domains_card.get_pw_qpolynomial_list()
-  # if ql.n_pw_qpolynomial() != 1:
-  #   raise ValueError("Multiple pieces polynomial not supported")
-  # all_domains_card = ql.get_at(0)
-  # domain_qpoly_pairs = []
-  # for card_domain, card_qpoly in all_domains_card.get_pieces():
-  #   card_domain = card_domain.move_dims(islpy.dim_type.set, 0,
-  #                                       islpy.dim_type.param, n_params,
-  #                                       card_domain.n_param() - n_params)
-  #   card_domain = [
-  #       card_domain_bs for card_domain_bs in card_domain.get_basic_sets()
-  #       if basic_set_is_bounded(card_domain_bs)
-  #   ]
-  #   if len(card_domain) == 0:
-  #     continue
-  #   qpoly_sum_of_terms = qpoly_to_sum_of_terms(card_qpoly, n_params)
-  #   qpoly_max_term = max(qpoly_sum_of_terms, key=term_order_key_func)
-  #   domain_qpoly_pairs.append((card_domain, qpoly_max_term))
+  all_domains = sched.program_get_domain(prog)
+  print("Card...")
+  all_domains_card = all_domains.card()
+  print("done")
+  ql = all_domains_card.get_pw_qpolynomial_list()
+  if ql.n_pw_qpolynomial() != 1:
+    raise ValueError("Multiple pieces polynomial not supported")
+  all_domains_card = ql.get_at(0)
+  domain_qpoly_pairs = []
+  for card_domain, card_qpoly in all_domains_card.get_pieces():
+    card_domain = card_domain.move_dims(islpy.dim_type.set, 0,
+                                        islpy.dim_type.param, n_params,
+                                        card_domain.n_param() - n_params)
+    card_domain = [
+        card_domain_bs for card_domain_bs in card_domain.get_basic_sets()
+        if basic_set_is_bounded(card_domain_bs)
+    ]
+    if len(card_domain) == 0:
+      continue
+    qpoly_sum_of_terms = qpoly_to_sum_of_terms(card_qpoly, n_params)
+    qpoly_max_term = max(qpoly_sum_of_terms, key=term_order_key_func)
+    domain_qpoly_pairs.append((card_domain, qpoly_max_term))
 
-  # all_seen_qpolys = set(qst for _, qst in domain_qpoly_pairs)
-  # sorted_qpolys = {
-  #     qpoly: i for i, qpoly in enumerate(
-  #         sorted(all_seen_qpolys, key=term_order_key_func))
-  # }
-  # complexity_terms = []
-  # for card_domain, qpoly_max_term in domain_qpoly_pairs:
-  #   qpoly_max_term_rank = sorted_qpolys[qpoly_max_term]
-  #   for card_domain_bs in card_domain:
-  #     card_domain_bs = card_domain_bs.project_out_all_params().get_basic_sets()
-  #     assert len(card_domain_bs) == 1
-  #     card_domain_bs = card_domain_bs[0]
-  #     not_in_card_domain_bs_indicators = []
-  #     for neg_card_domain_bs in card_domain_bs.complement().make_disjoint(
-  #     ).get_basic_sets():
-  #       div_vars = mdl.addVars(neg_card_domain_bs.dim(islpy.dim_type.div),
-  #                              vtype=GRB.INTEGER,
-  #                              name="div_vars").values()
-  #       not_in_card_domain_bs_indicator = mdl.addVar(
-  #           vtype=GRB.BINARY, name="card_domain_indicator")
-  #       eq_mat = isl_utils.isl_mat_to_numpy(
-  #           neg_card_domain_bs.equalities_matrix(*ISL_SET_MAT_DIM_ORDER))
-  #       ineq_mat = isl_utils.isl_mat_to_numpy(
-  #           neg_card_domain_bs.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
-  #       symb_vars = np.array([
-  #           symb_name_to_var[n]
-  #           for n in neg_card_domain_bs.get_var_names(islpy.dim_type.set)
-  #       ] + div_vars + [1])
-  #       for c in eq_mat.dot(symb_vars):
-  #         mdl.addConstr((not_in_card_domain_bs_indicator == 1) >> (c == 0))
-  #       for c in ineq_mat.dot(symb_vars):
-  #         mdl.addConstr((not_in_card_domain_bs_indicator == 1) >> (c >= 0))
-  #       not_in_card_domain_bs_indicators.append(not_in_card_domain_bs_indicator)
+  all_seen_qpolys = set(qst for _, qst in domain_qpoly_pairs)
+  sorted_qpolys = {
+      qpoly: i for i, qpoly in enumerate(
+          sorted(all_seen_qpolys, key=term_order_key_func))
+  }
+  complexity_terms = []
+  for card_domain, qpoly_max_term in domain_qpoly_pairs:
+    qpoly_max_term_rank = sorted_qpolys[qpoly_max_term]
+    for card_domain_bs in card_domain:
+      card_domain_bs = card_domain_bs.project_out_all_params().get_basic_sets()
+      assert len(card_domain_bs) == 1
+      card_domain_bs = card_domain_bs[0]
+      not_in_card_domain_bs_indicators = []
+      for neg_card_domain_bs in card_domain_bs.complement().make_disjoint(
+      ).get_basic_sets():
+        div_vars = mdl.addVars(neg_card_domain_bs.dim(islpy.dim_type.div),
+                               vtype=GRB.INTEGER,
+                               name="div_vars").values()
+        not_in_card_domain_bs_indicator = mdl.addVar(
+            vtype=GRB.BINARY, name="card_domain_indicator")
+        eq_mat = isl_utils.isl_mat_to_numpy(
+            neg_card_domain_bs.equalities_matrix(*ISL_SET_MAT_DIM_ORDER))
+        ineq_mat = isl_utils.isl_mat_to_numpy(
+            neg_card_domain_bs.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
+        symb_vars = np.array([
+            symb_name_to_var[n]
+            for n in neg_card_domain_bs.get_var_names(islpy.dim_type.set)
+        ] + div_vars + [1])
+        for c in eq_mat.dot(symb_vars):
+          mdl.addConstr((not_in_card_domain_bs_indicator == 1) >> (c == 0))
+        for c in ineq_mat.dot(symb_vars):
+          mdl.addConstr((not_in_card_domain_bs_indicator == 1) >> (c >= 0))
+        not_in_card_domain_bs_indicators.append(not_in_card_domain_bs_indicator)
 
-  #     not_in_card_domain_indicator = mdl.addVar(vtype=GRB.BINARY,
-  #                                               name="card_domain_indicator")
-  #     mdl.addConstr(not_in_card_domain_indicator == gp.or_(
-  #         *not_in_card_domain_bs_indicators))
-  #     complexity_term = mdl.addVar(vtype=GRB.CONTINUOUS)
-  #     mdl.addConstr(complexity_term == (1 - not_in_card_domain_indicator) *
-  #                   qpoly_max_term_rank)
-  #     complexity_terms.append(complexity_term)
+      not_in_card_domain_indicator = mdl.addVar(vtype=GRB.BINARY,
+                                                name="card_domain_indicator")
+      mdl.addConstr(not_in_card_domain_indicator == gp.or_(
+          *not_in_card_domain_bs_indicators))
+      complexity_term = mdl.addVar(vtype=GRB.CONTINUOUS)
+      mdl.addConstr(complexity_term == (1 - not_in_card_domain_indicator) *
+                    qpoly_max_term_rank)
+      complexity_terms.append(complexity_term)
 
-  # obj = mdl.addVar(name="objective")
-  # assert len(complexity_terms) > 0
-  # mdl.addConstr(obj == gp.max_(*complexity_terms))
-  obj = 1
+  obj = mdl.addVar(name="objective")
+  assert len(complexity_terms) > 0
+  mdl.addConstr(obj == gp.max_(*complexity_terms))
   mdl.setObjective(obj, GRB.MINIMIZE)
   return mdl
 
@@ -468,6 +476,7 @@ def apply_symbolic_st(prog: ir.Program):
       if stmt.is_reduction
   ]
   _, share_space_map = st.compute_share_space(prog)
+  print(share_space_map)
   st_count = 0
   while len(unprocessed_reductions) > 0:
     reduction_id = unprocessed_reductions.pop()
@@ -504,15 +513,17 @@ def apply_symbolic_st(prog: ir.Program):
 
 if __name__ == "__main__":
   prog = ir.Program.read_from_string("""
-  A[i] += B[j]# { [i, j] : 0 <= i < 2 & 0 <= j < i };
-  B[i] = A[i] # { [i] : 0 <= i <= 1 };
+  N
+  A[i] += B[N-j] # { [j, i] : 0 <= i < N & 0 <= j < i };
+  B[i] = A[i] # { [i] : 0 <= i < N };
   # B[i] = A[i] # { [i] : 0 <= i < 2 };
   # A1[i] += B1[j] # { [i, j] : 0 <= i < N & 0 <= j < i};
   # B[i] = f(B[i]) # { [i] : 0 <= i < N };
   """)
   # domain = islpy.BasicSet("[N] -> { [i] : 0 <= i < N }")
-  # new_prog = apply_symbolic_st(prog)
-  new_prog = prog
+  print(prog)
+  new_prog = apply_symbolic_st(prog)
+  # new_prog = prog
   print(new_prog)
   mdl = bilp_schedule_build_gurobi_model(new_prog, 2)
   mdl.optimize()

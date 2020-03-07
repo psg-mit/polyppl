@@ -165,6 +165,7 @@ class AffineExpresionCollector(astor.TreeWalk):
   AnnotationMap = Dict[VarID, ExpressionKind]
 
   def __init__(self,
+               param_space_names: List[VarID],
                domain_space_names: List[VarID],
                node: ast.Expression,
                scope_info=None,
@@ -173,7 +174,8 @@ class AffineExpresionCollector(astor.TreeWalk):
     if scope_info is None:
       scope_info = ast_scope.annotate(node)
     self.scope_info = scope_info
-    self.domain_space_names = set(domain_space_names)
+    self.param_domain_space_names = set(domain_space_names) | set(
+        param_space_names)
     self.annotation: AffineExpresionCollector.AnnotationMap = defaultdict(
         lambda: self.ExpressionKind.non_affine)
     astor.TreeWalk.__init__(self, node=node, *args, **kwargs)
@@ -214,7 +216,7 @@ class AffineExpresionCollector(astor.TreeWalk):
   def post_Name(self):
     node = self.cur_node
     if isinstance(self.scope_info[node], ast_scope.scope.GlobalScope):
-      if node.id in self.domain_space_names:
+      if node.id in self.param_domain_space_names:
         self.annotation[node] = self.ExpressionKind.affine_l2
         return
     self.annotation[node] = self.ExpressionKind.non_affine
@@ -240,7 +242,7 @@ def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
       sign = coeff > 0
     else:
       numerator = coeff.get_num_si()
-      if numerator == 1:
+      if abs(numerator) == 1:
         term = ast.Name(id=var, ctx=ast.Load())
       elif numerator == 0:
         continue
@@ -261,8 +263,10 @@ def aff_to_ast(aff: islpy.Aff, domain_space_names: List[VarID]) -> ast.AST:
 
   if len(terms) > 0:
     aff_ast = terms[0]
+    if not signs[0]:
+      aff_ast = ast.UnaryOp(op=ast.USub(), operand=aff_ast)
     for term, sign in zip(terms[1:], signs[1:]):
-      if sign > 0:
+      if sign:
         op = ast.Add()
       else:
         op = ast.Sub()

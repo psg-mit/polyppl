@@ -265,11 +265,11 @@ class ShareSpaceCollector(ir.AffineExprWalker):
     read_map = ir.read_ast_to_map(read, self.ctx, self.domain_space_names,
                                   self.param_space_names,
                                   self.affine_annotation)
+    #TODO(camyang) handle if read_map returns multiple targets
     if read.value.id not in self.lhs_share_space_map:
       self.lhs_share_space_map[read.value.id] = basic_set_zero(
           read_map.range().get_space())
     array_ref_share_space_set = self.lhs_share_space_map[read.value.id]
-
     share_space_set = array_ref_share_space_set.apply(read_map.reverse())
     share_space_set = isl_utils.compute_lineality_space(share_space_set)
     self.share_space_set = self.share_space_set.intersect(share_space_set)
@@ -278,7 +278,8 @@ class ShareSpaceCollector(ir.AffineExprWalker):
 def compute_share_space_for_statement(
     stmt: ir.Statement, declared_lhs_symbols: Set[ir.VarID],
     share_space_map: LhsShareSpaceMapType) -> islpy.BasicSet:
-  affine_expr_collector = ir.AffineExpresionCollector(stmt.domain_space_names,
+  affine_expr_collector = ir.AffineExpresionCollector(stmt.param_space_names,
+                                                      stmt.domain_space_names,
                                                       stmt.rhs)
   reads = schedule.ASTCollectRead(stmt.rhs, declared_lhs_symbols).reads
   share_space_collector = ShareSpaceCollector(stmt.domain.get_ctx(),
