@@ -7,6 +7,7 @@ import enum
 import copy
 import ast
 from collections import defaultdict
+import itertools
 
 import ast_scope
 import astor
@@ -53,7 +54,8 @@ def simplification_transformation_core(
     prog: ir.Program,
     stmt_id: ir.Program.StatementID,
     r_e: islpy.MultiAff,
-    r_e_symb_domain: islpy.Set = None) -> ir.Program:
+    r_e_symb_domain: islpy.Set = None,
+    build_add_sub_correspondance=False) -> ir.Program:
   """Apply Simplification Transformation with given reuse direction.
 
   We allow the reuse direction to be symbolic.
@@ -72,8 +74,13 @@ def simplification_transformation_core(
     put on the symbolic parameters. In the above example, a valid
     r_e_symb_domain could be [N, u, v] -> { : u < 0 or u > 0 }.
 
+    build_add_sub_correspondance: this option is applicable if this is a
+    symbolic ST. if True, also returns a map between introduced X_add and X_sub
+    statements. This is useful mainly for tracking correspondance between newly
+    introduced reductions by the symbolic ST, that must be mutually exclusive
+    with each other.
   Returns:
-    the transformed program.
+    the transformed program. [correspondance map]
   """
 
   is_symbolic_st = r_e_symb_domain is not None
@@ -121,41 +128,91 @@ def simplification_transformation_core(
                                      "it should only have 1 piece")
   r_e_lhs_ma = r_e_lhs_ma.as_multi_aff()
 
+  # X_add
   X_add_name = ir.ArrayID(reduction.lhs_array_name + "_add")
-  X_add_domain = D_E.subtract(D_E_p)
-  X_add_domain = X_add_domain.intersect_params(r_e_symb_domain).make_disjoint()
   X_add_access = _make_simple_subscript_ast(X_add_name,
                                             lhs_space_tmp_var_names,
                                             store=False)
-  if not X_add_domain.is_empty():
-    for X_add_domain_basic in X_add_domain.get_basic_sets():
+  X_add_domain = D_E.subtract(D_E_p).make_disjoint()
+  X_add_domain_basics = X_add_domain.get_basic_sets()
+  r_e_symb_domain_basics = r_e_symb_domain.get_basic_sets()
+  X_add_stmts = []  # used by sub domain computation
+  for X_add_domain_basic, r_e_symb_domain_basic in itertools.product(
+      X_add_domain_basics, r_e_symb_domain_basics):
+    X_add_domain_basic = X_add_domain_basic.intersect_params(
+        r_e_symb_domain_basic)
+    if not X_add_domain_basic.is_empty():
       X_add_stmt = ir.Statement(X_add_domain_basic, reduction.param_space_names,
                                 reduction.domain_space_names, X_add_name,
                                 reduction.rhs, reduction.lhs_proj, reduction.op,
                                 reduction.non_affine_constraints,
                                 reduction.histograms)
-      prog.add_statement(X_add_stmt)
+      X_add_stmts.append(prog.add_statement(X_add_stmt))
+    else:
+      X_add_stmts.append(None)
 
+  # X_sub
   X_sub_name = ir.ArrayID(reduction.lhs_array_name + "_sub")
-  X_sub_domain = D_int.apply(lhs_proj_map.reverse()).intersect(
-      D_E_p.subtract(D_E)).apply(r_e_map)
-  X_sub_domain = X_sub_domain.intersect_params(r_e_symb_domain).make_disjoint()
   X_sub_access = _make_simple_subscript_ast(X_sub_name,
                                             lhs_space_tmp_var_names,
                                             store=False)
+  D_int_rev_lhs_proj_set = D_int.apply(lhs_proj_map.reverse())
+  X_sub_domain_basics = []
+  X_add_stmts_correspondance = []
+  X_sub_domain = islpy.Set.empty(X_add_domain.get_space())
+
+  def negate_params(obj):
+    return isl_utils.negate_params(
+        obj,
+        X_add_domain.dim(islpy.dim_type.param) -
+        X_add_domain.dim(islpy.dim_type.set),
+        X_add_domain.dim(islpy.dim_type.set))
+
+  for i, ((X_add_domain_basic, r_e_symb_domain_basic), X_add_stmt) in enumerate(
+      zip(itertools.product(X_add_domain_basics, r_e_symb_domain_basics),
+          X_add_stmts)):
+    X_sub_domain_basic = negate_params(X_add_domain_basic)
+    r_e_symb_domain_basic_neg = negate_params(r_e_symb_domain_basic)
+    neg = False
+    if r_e_symb_domain_basic_neg.is_subset(r_e_symb_domain):
+      r_e_symb_domain_basic = r_e_symb_domain_basic_neg
+      neg = True
+    X_sub_domain_basic = X_sub_domain_basic.intersect(
+        D_int_rev_lhs_proj_set.apply(r_e_map)).intersect_params(
+            r_e_symb_domain_basic)
+    if not X_sub_domain_basic.is_empty():
+      X_sub_domain_basics.append(X_sub_domain_basic)
+      if X_add_stmt is not None and neg:
+        X_add_stmts_correspondance.append(X_add_stmt)
+      else:
+        X_add_stmts_correspondance.append(None)
+    X_sub_domain = X_sub_domain.union(X_sub_domain_basic)
+
+  # Check X_sub_domain is correctly computed
+  X_sub_domain1 = D_E_p.subtract(D_E).intersect(D_int_rev_lhs_proj_set).apply(
+      r_e_map).intersect_params(r_e_symb_domain)
+  assert X_sub_domain1 == X_sub_domain, "Something went wrong"
+
   if not X_sub_domain.is_empty():
     if reduction.op not in inverse_op_map:
       raise ValueError("Operator must have an inverse to have non-empty D_sub")
-    # No need to check for n_pieces == 1 again here
-    r_rev_f = islpy.PwMultiAff.from_map(r_e_lhs_map.reverse()).as_multi_aff()
-    for X_sub_domain_basic in X_sub_domain.get_basic_sets():
-      X_sub_stmt = ir.Statement(X_sub_domain_basic, reduction.param_space_names,
-                                reduction.domain_space_names, X_sub_name,
-                                reduction.rhs,
-                                r_rev_f.pullback_multi_aff(reduction.lhs_proj),
-                                reduction.op, reduction.non_affine_constraints,
-                                reduction.histograms)
-      prog.add_statement(X_sub_stmt)
+
+  del X_sub_domain1, X_sub_domain
+
+  # No need to check for n_pieces == 1 again here
+  correspondance_map = {}
+  r_rev_f = islpy.PwMultiAff.from_map(r_e_lhs_map.reverse()).as_multi_aff()
+  for X_sub_domain_basic, X_add_stmt_id in zip(X_sub_domain_basics,
+                                               X_add_stmts_correspondance):
+    X_sub_stmt = ir.Statement(X_sub_domain_basic, reduction.param_space_names,
+                              reduction.domain_space_names, X_sub_name,
+                              reduction.rhs,
+                              r_rev_f.pullback_multi_aff(reduction.lhs_proj),
+                              reduction.op, reduction.non_affine_constraints,
+                              reduction.histograms)
+    X_sub_stmt_id = prog.add_statement(X_sub_stmt)
+    if X_add_stmt_id is not None:
+      correspondance_map[X_add_stmt_id] = X_sub_stmt_id
 
   index_args = ir.multi_aff_to_ast(r_e_lhs_ma, lhs_space_tmp_var_names)
   shifted_X_access = _make_subscript_ast(reduction.lhs_array_name,
@@ -214,7 +271,11 @@ def simplification_transformation_core(
                                           symb_eq_zero.n_param() - i - 1, 0)
     reduction.domain = D_E.intersect_params(symb_eq_zero)
     reduction.lhs_proj = reduction.lhs_proj.align_params(param_space)
-  return prog
+
+  if build_add_sub_correspondance:
+    return prog, correspondance_map
+  else:
+    return prog
 
 
 LhsShareSpaceMapType = Dict[ir.VarID, islpy.BasicSet]

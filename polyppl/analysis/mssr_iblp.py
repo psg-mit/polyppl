@@ -111,6 +111,9 @@ def term_comparator_from_symbol_order(symbol_order: List[int]):
 
 def bilp_schedule_build_gurobi_model(prog: ir.Program,
                                      schedule_dim: int,
+                                     correspondance_map: Dict[
+                                         ir.Program.StatementID,
+                                         ir.Program.StatementID],
                                      model_name="model",
                                      term_comparator: Callable[[Term, Term],
                                                                bool] = None,
@@ -502,13 +505,15 @@ def sample_vector_from_reuse_set_symbolic(
   return shift, shift_symb_param_domain
 
 
-def apply_symbolic_st(prog: ir.Program):
+def apply_symbolic_st(prog: ir.Program, reduce_shift_vars=True):
   unprocessed_reductions = [
       stmt_id for stmt_id, _, stmt in prog.iter_named_statements()
       if stmt.is_reduction
   ]
   _, share_space_map = st.compute_share_space(prog)
   st_count = 0
+  correspondance_map = {}
+  reduction_id_to_shift_name = {}
   while len(unprocessed_reductions) > 0:
     reduction_id = unprocessed_reductions.pop()
     reuse_set = compute_reuse_set_for_statement_symbolic(
@@ -516,11 +521,24 @@ def apply_symbolic_st(prog: ir.Program):
     if reuse_set.is_empty():
       continue
     # reuse_set = reuse_set.union(isl_utils.basic_set_zero(reuse_set.get_space()))
+    if (reduce_shift_vars and reduction_id in correspondance_map and
+        correspondance_map[reduction_id] in reduction_id_to_shift_name):
+      shift_name_prefix = reduction_id_to_shift_name[
+          correspondance_map[reduction_id]]
+    else:
+      shift_name_prefix = "L{}".format(st_count)
     r_e, r_e_param_symb_domain = sample_vector_from_reuse_set_symbolic(
-        reuse_set, "L{}".format(st_count))
+        reuse_set, shift_name_prefix)
+    reduction_id_to_shift_name[reduction_id] = shift_name_prefix
     old_num_stmts = len(prog.statements)
-    new_prog = st.simplification_transformation_core(prog, reduction_id, r_e,
-                                                     r_e_param_symb_domain)
+    new_prog, cm = st.simplification_transformation_core(
+        prog,
+        reduction_id,
+        r_e,
+        r_e_param_symb_domain,
+        build_add_sub_correspondance=True)
+    correspondance_map.update(cm)
+    correspondance_map.update({v: k for k, v in cm.items()})
     new_num_stmts = len(new_prog.statements)
     new_stmt_ids = list(
         itertools.islice(reversed(new_prog.statements.keys()),
@@ -535,7 +553,7 @@ def apply_symbolic_st(prog: ir.Program):
     unprocessed_reductions += new_reduction_ids
     st_count += 1
     prog = new_prog
-  return prog
+  return prog, correspondance_map
 
 
 ################################################################################
@@ -553,10 +571,11 @@ if __name__ == "__main__":
   """)
   # domain = islpy.BasicSet("[N] -> { [i] : 0 <= i < N }")
   print(prog)
-  new_prog = apply_symbolic_st(prog)
+  new_prog, correspondance_map = apply_symbolic_st(prog,
+                                                   reduce_shift_vars=False)
   # new_prog = prog
   print(new_prog)
-  mdl = bilp_schedule_build_gurobi_model(new_prog, 2)
+  mdl = bilp_schedule_build_gurobi_model(new_prog, 2, correspondance_map)
   mdl.optimize()
   sym_to_cst = gurobi_model_extract_shift_vars(mdl)
   concretize_symbolic_program(new_prog, sym_to_cst)

@@ -61,6 +61,26 @@ def set_all_tuple_names(umap, dim, name):
   return ret
 
 
+def negate_params(obj, idx: int, n: int):
+  original_obj = obj
+  obj = obj.add_dims(islpy.dim_type.param, n)
+  space = obj.get_space()
+  for i in range(n):
+    orig_param_aff = islpy.Aff.var_on_domain(space, islpy.dim_type.param,
+                                             idx + i)
+    new_param_aff = islpy.Aff.var_on_domain(space, islpy.dim_type.param,
+                                            idx + n + i)
+    obj = obj.add_constraint(
+        islpy.Constraint.equality_from_aff(orig_param_aff.add(new_param_aff)))
+  obj = obj.project_out(islpy.dim_type.param, idx, n)
+  for i in range(n):
+    obj = obj.set_dim_name(
+        islpy.dim_type.param, idx + i,
+        original_obj.get_dim_name(islpy.dim_type.param, idx + i))
+  assert type(obj) == type(original_obj)
+  return obj
+
+
 def bijective_basic_map_to_multi_aff(bm: islpy.BasicMap) -> islpy.MultiAff:
   if not bm.is_bijective():
     raise ValueError("BasicMap is not bijective")
