@@ -192,12 +192,14 @@ def simplification_transformation_core(
   X_sub_domain1 = D_E_p.subtract(D_E).intersect(D_int_rev_lhs_proj_set).apply(
       r_e_map).intersect_params(r_e_symb_domain)
   assert X_sub_domain1 == X_sub_domain, "Something went wrong"
+  assert len(X_sub_domain_basics) == len(X_sub_domain1.get_basic_sets())
 
   if not X_sub_domain.is_empty():
     if reduction.op not in inverse_op_map:
       raise ValueError("Operator must have an inverse to have non-empty D_sub")
 
-  del X_sub_domain1, X_sub_domain
+  # del X_sub_domain1, X_sub_domain
+  # X_sub_domain_basics = X_sub_domain.get_basic_sets()
 
   # No need to check for n_pieces == 1 again here
   correspondance_map = {}
