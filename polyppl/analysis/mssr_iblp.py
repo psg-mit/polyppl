@@ -4,6 +4,7 @@ from typing import List, Tuple, Dict, Any, Callable
 import itertools
 import operator
 import functools
+import copy
 
 import ast
 
@@ -109,16 +110,15 @@ def term_comparator_from_symbol_order(symbol_order: List[int]):
   return term_comparator
 
 
-def bilp_schedule_build_gurobi_model(prog: ir.Program,
-                                     schedule_dim: int,
-                                     correspondance_map: Dict[
-                                         ir.Program.StatementID,
-                                         ir.Program.StatementID],
-                                     model_name="model",
-                                     term_comparator: Callable[[Term, Term],
-                                                               bool] = None,
-                                     K: int = 10000,
-                                     use_affine_formulation=True) -> gp.Model:
+def bilp_schedule_build_gurobi_model(
+    prog: ir.Program,
+    schedule_dim: int,
+    correspondance_map: Dict[ir.Program.StatementID, ir.Program.StatementID],
+    r_e_param_symb_domain: Dict[ir.Program.StatementID, islpy.Set],
+    model_name="model",
+    term_comparator: Callable[[Term, Term], bool] = None,
+    K: int = 10000,
+    use_affine_formulation=True) -> gp.Model:
   #TODO(camyang) implement non affine formulation
   if use_affine_formulation:
     if K < 0:
@@ -255,21 +255,31 @@ def bilp_schedule_build_gurobi_model(prog: ir.Program,
           # else:
           #   mdl.addConstr((need_sat == 1) >> (lhs == tmp_var))
   # Reuse direction constraints
-  symb_domain = islpy.Set.empty(
+  symb_domain = islpy.Set.universe(
       islpy.Space.create_from_names(prog.ctx,
                                     set=[],
                                     params=symb_name_to_var.keys()))
-  for _, stmt_name, stmt in prog.iter_named_statements():
+  for stmt_id, stmt_name, stmt in prog.iter_named_statements():
     if not stmt.is_reduction:
       continue
-    stmt_symb_domain = stmt.domain.project_out(islpy.dim_type.param, 0,
-                                               n_params).project_out(
-                                                   islpy.dim_type.set, 0,
-                                                   stmt.domain.n_dim())
-    symb_domain = symb_domain.union(stmt_symb_domain)
-  symb_domain = symb_domain.coalesce().move_dims(islpy.dim_type.set, 0,
-                                                 islpy.dim_type.param, 0,
-                                                 symb_domain.n_param())
+    if stmt_id not in r_e_param_symb_domain:
+      continue
+    stmt_r_e_symb_domain = r_e_param_symb_domain[stmt_id].add_dims(
+        islpy.dim_type.set, 0)
+    domain = stmt.domain.project_out(islpy.dim_type.set, 0,
+                                     stmt.domain.n_dim()).project_out(
+                                         islpy.dim_type.param, 0, n_params)
+    precond = domain.remove_dims(islpy.dim_type.param,
+                                 domain.n_param() - stmt.domain.n_dim(),
+                                 stmt.domain.n_dim())
+    domain_enabled_r_e_constraint = stmt_r_e_symb_domain.project_out(
+        islpy.dim_type.param, 0, n_params).union(domain)
+    r_e_constraint = precond.complement().union(
+        domain_enabled_r_e_constraint).coalesce()
+    symb_domain = symb_domain.intersect(r_e_constraint).coalesce()
+  symb_domain = symb_domain.move_dims(islpy.dim_type.set, 0,
+                                      islpy.dim_type.param, 0,
+                                      symb_domain.n_param()).make_disjoint()
   in_symb_domain_bs_indicators = []
   for symb_domain_bs in symb_domain.get_basic_sets():
     eq_mat = isl_utils.isl_mat_to_numpy(
@@ -278,7 +288,7 @@ def bilp_schedule_build_gurobi_model(prog: ir.Program,
         symb_domain_bs.inequalities_matrix(*ISL_SET_MAT_DIM_ORDER))
     symb_vars = np.array([
         symb_name_to_var[n]
-        for n in symb_domain.get_var_names(islpy.dim_type.set)
+        for n in symb_domain_bs.get_var_names(islpy.dim_type.set)
     ] + [1])
     in_symb_domain_bs = mdl.addVar(vtype=GRB.BINARY,
                                    name="in_symb_domain_bs_indicator")
@@ -391,7 +401,37 @@ def concretize_isl_object(isl_obj: Any, n_initial_params: int,
   return isl_obj
 
 
+def concretize_isl_aff(aff: islpy.Aff, n_initial_params: int,
+                       sym_to_cst: Dict[str, int]):
+  n_total_param = aff.dim(islpy.dim_type.param)
+  cst = aff.get_constant_val().to_python()
+  for i in range(n_initial_params, n_total_param):
+    name = aff.get_dim_name(islpy.dim_type.param, i)
+    coeff = aff.get_coefficient_val(islpy.dim_type.param, i)
+    cst += coeff * sym_to_cst[name]
+  aff = aff.drop_dims(islpy.dim_type.param, n_initial_params,
+                      n_total_param - n_initial_params)
+  aff = aff.set_constant_val(cst)
+  return aff
+
+
+def concretize_isl_multi_aff(multi_aff: islpy.MultiAff, n_initial_params: int,
+                             sym_to_cst: Dict[str, int]):
+  n_aff = multi_aff.dim(islpy.dim_type.out)
+  ret_aff_list = islpy.AffList.alloc(multi_aff.get_ctx(), n_aff)
+  for i in range(n_aff):
+    concretized_aff = concretize_isl_aff(multi_aff.get_aff(i), n_initial_params,
+                                         sym_to_cst)
+    ret_aff_list = ret_aff_list.add(concretized_aff)
+  n_total_param = multi_aff.dim(islpy.dim_type.param)
+  space = multi_aff.get_space().drop_dims(islpy.dim_type.param,
+                                          n_initial_params,
+                                          n_total_param - n_initial_params)
+  return islpy.MultiAff.from_aff_list(space, ret_aff_list)
+
+
 def concretize_symbolic_program(prog: ir.Program, sym_to_cst: Dict[str, int]):
+  prog = copy.deepcopy(prog)
   n_params = len(prog.param_space_names)
   to_remove = []
   ast_replacement_map = {
@@ -400,13 +440,13 @@ def concretize_symbolic_program(prog: ir.Program, sym_to_cst: Dict[str, int]):
   for stmt_id, _, stmt in prog.iter_named_statements():
     stmt.domain = concretize_isl_object(stmt.domain, n_params, sym_to_cst)
     stmt.rhs = ir.ast_replace_free_vars(stmt.rhs, ast_replacement_map)
-    stmt.lhs_proj = stmt.lhs_proj.drop_dims(
-        islpy.dim_type.param, n_params,
-        stmt.lhs_proj.dim(islpy.dim_type.param) - n_params)
+    stmt.lhs_proj = concretize_isl_multi_aff(stmt.lhs_proj, n_params,
+                                             sym_to_cst)
     if stmt.domain.is_empty():
       to_remove.append(stmt_id)
   for stmt_id in to_remove:
     prog.remove_statement(stmt_id)
+  return prog
 
 
 def compute_effective_linear_space_symbolic(
@@ -514,6 +554,7 @@ def apply_symbolic_st(prog: ir.Program, reduce_shift_vars=True):
   st_count = 0
   correspondance_map = {}
   reduction_id_to_shift_name = {}
+  reduction_r_e_param_symn_domain = {}
   while len(unprocessed_reductions) > 0:
     reduction_id = unprocessed_reductions.pop()
     reuse_set = compute_reuse_set_for_statement_symbolic(
@@ -529,6 +570,7 @@ def apply_symbolic_st(prog: ir.Program, reduce_shift_vars=True):
       shift_name_prefix = "L{}".format(st_count)
     r_e, r_e_param_symb_domain = sample_vector_from_reuse_set_symbolic(
         reuse_set, shift_name_prefix)
+    reduction_r_e_param_symn_domain[reduction_id] = r_e_param_symb_domain
     reduction_id_to_shift_name[reduction_id] = shift_name_prefix
     old_num_stmts = len(prog.statements)
     new_prog, cm = st.simplification_transformation_core(
@@ -553,7 +595,7 @@ def apply_symbolic_st(prog: ir.Program, reduce_shift_vars=True):
     unprocessed_reductions += new_reduction_ids
     st_count += 1
     prog = new_prog
-  return prog, correspondance_map
+  return prog, correspondance_map, reduction_r_e_param_symn_domain
 
 
 ################################################################################
@@ -571,15 +613,16 @@ if __name__ == "__main__":
   """)
   # domain = islpy.BasicSet("[N] -> { [i] : 0 <= i < N }")
   print(prog)
-  new_prog, correspondance_map = apply_symbolic_st(prog,
-                                                   reduce_shift_vars=False)
+  new_prog, correspondance_map, r_e_param_symb_domain = apply_symbolic_st(
+      prog, reduce_shift_vars=True)
   # new_prog = prog
   print(new_prog)
-  mdl = bilp_schedule_build_gurobi_model(new_prog, 2, correspondance_map)
+  mdl = bilp_schedule_build_gurobi_model(new_prog, 2, correspondance_map,
+                                         r_e_param_symb_domain)
   mdl.optimize()
   sym_to_cst = gurobi_model_extract_shift_vars(mdl)
-  concretize_symbolic_program(new_prog, sym_to_cst)
-  print(new_prog)
+  concretized_prog = concretize_symbolic_program(new_prog, sym_to_cst)
+  print(concretized_prog)
   # def iterate_domain_faces(reduction: ir.Statement):
 
   #   proj_kernel = isl_utils.compute_null_space(reduction.lhs_proj)
