@@ -12,7 +12,7 @@ The benchmarks used in the paper can be found in `benchmarks/`.
 Dependencies
 -------------
 
-To run the code, we require a source install of [islpy](https://github.com/inducer/islpy.git) with barvinok package enabled.
+To run the code, we require a source install of [islpy](https://pypi.org/project/islpy/) with barvinok package enabled.
 The barvinok package is _required_ for counting the polyhedron sizes to compute program complexities.
 
 Tests
