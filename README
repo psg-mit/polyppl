@@ -1,0 +1,26 @@
+PolyPPL
+========
+
+This is repo contains experiments for the paper _Simplifying Dependent Reductions in the Polyhedral Model_.
+
+Benchmarks
+----------
+
+The benchmarks used in the paper can be found in `benchmarks/`.
+
+
+Dependencies
+-------------
+
+To run the code, we require a source install of [islpy](https://github.com/inducer/islpy.git) with barvinok package enabled.
+The barvinok package is _required_ for counting the polyhedron sizes to compute program complexities.
+
+Tests
+-----
+
+To run the tests, do 
+```python
+python -m unittest
+```
+
+This will also generate all the Cython source code for the benchmarks, on which you can manually compile and run the compiled programs to validate the runtime numbers in the paper.
